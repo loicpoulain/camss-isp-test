@@ -472,7 +472,8 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	struct vnode_ctx in_ctx  = { .fd = -1 };
 	struct vnode_ctx out_ctx = { .fd = -1 };
 	struct capture_ctx cap_ctx = { .fd = -1 };
-	int cap_buf_idx = -1; /* capture buffer currently held by OPE */
+	int cap_buf_for_ope_slot[MAX_PIPELINE_BUFS]; /* capture buf idx for each OPE input slot */
+	for (int _i = 0; _i < MAX_PIPELINE_BUFS; _i++) cap_buf_for_ope_slot[_i] = -1;
 	struct isp_vnode *in_vn, *out_vn, *params_vn;
 	struct params_ctx params_ctx = { .fd = -1 };
 	struct params_config *params_cfgs = NULL;
@@ -630,22 +631,28 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		}
 	}
 
-	/* Pre-queue `depth` input buffers. depth=1 gives accurate per-frame
-	 * timing; higher values increase throughput but timestamps reflect
-	 * STREAMON time for all pre-queued buffers. */
+	/* Pre-queue input buffers.
+	 * Capture path: submit one capture frame to OPE before STREAMON;
+	 * remaining capture buffers stay queued to the capture device and
+	 * are fed to OPE asynchronously in the hot loop.
+	 * Non-capture path: fill and queue all depth buffers as before. */
 	for (int i = 0; i < (int)depth; i++) {
 		if (cfg->input_device) {
-			/* Dqbuf one frame from capture, submit as dmabuf to OPE */
-			int cidx = capture_dqbuf(&cap_ctx);
-			if (cidx < 0) {
-				perror("capture: VIDIOC_DQBUF pre-queue");
-				goto out;
+			if (i == 0) {
+				/* Submit first capture frame to OPE synchronously */
+				int cidx = capture_dqbuf(&cap_ctx);
+				if (cidx < 0) {
+					perror("capture: VIDIOC_DQBUF pre-queue");
+					goto out;
+				}
+				if (ope_in_qbuf_dmabuf(&in_ctx, 0, cap_ctx.dmabuf_fds[cidx]) < 0) {
+					perror("VIDIOC_QBUF input dmabuf");
+					goto out;
+				}
+				cap_buf_for_ope_slot[0] = cidx;
 			}
-			if (ope_in_qbuf_dmabuf(&in_ctx, i, cap_ctx.dmabuf_fds[cidx]) < 0) {
-				perror("VIDIOC_QBUF input dmabuf");
-				goto out;
-			}
-			cap_buf_idx = cidx;
+			/* depth>1 slots: capture buffers stay in capture device queue,
+			 * fed to OPE asynchronously when capture frames arrive. */
 		} else {
 			if (input_fd >= 0) {
 				lseek(input_fd, 0, SEEK_SET);
@@ -687,10 +694,15 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		perror("VIDIOC_STREAMON input");
 		goto out;
 	}
-	/* All pre-queued input buffers start at STREAMON time */
 	uint64_t streamon_ns = now_ns();
-	for (unsigned int i = 0; i < depth; i++)
-		submit_ns[i] = streamon_ns;
+	/* For capture path, submit_ns[0] set in pre-queue; others set in hot loop.
+	 * For non-capture path, all buffers submitted at STREAMON. */
+	if (!cfg->input_device) {
+		for (unsigned int i = 0; i < depth; i++)
+			submit_ns[i] = streamon_ns;
+	} else {
+		submit_ns[0] = streamon_ns; /* first capture frame submitted just before STREAMON */
+	}
 
 	if (cfg->duration_ms)
 		printf("\nStreaming  %.1f s...\n", cfg->duration_ms / 1000.0);
@@ -707,12 +719,13 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	while (!g_interrupted &&
 	       (cfg->duration_ms ? now_ns() < deadline_ns
 	                         : frames_done < cfg->num_frames)) {
-		/* Poll for output buffer ready */
-		struct pollfd pfd = {
-			.fd     = out_ctx.fd,
-			.events = POLLIN,
+		/* Poll: capture fd (when using capture device) + OPE output fd */
+		struct pollfd pfds[2] = {
+			{ .fd = out_ctx.fd,  .events = POLLIN },
+			{ .fd = cfg->input_device ? cap_ctx.fd : -1, .events = POLLIN },
 		};
-		int pret = poll(&pfd, 1, 2000);
+		int nfds = cfg->input_device ? 2 : 1;
+		int pret = poll(pfds, nfds, 2000);
 		if (pret < 0) {
 			if (errno == EINTR)
 				break;
@@ -725,9 +738,41 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			goto out_streamoff;
 		}
 
+		/* --- Capture fd ready: feed next frame to OPE input --- */
+		if (cfg->input_device && (pfds[1].revents & POLLIN)) {
+			uint64_t cap_qbuf_ns = now_ns();
+			int cidx = capture_dqbuf(&cap_ctx);
+			if (cidx < 0) {
+				perror("capture: VIDIOC_DQBUF");
+				goto out_streamoff;
+			}
+			/* Find a free OPE input slot (one that was just returned by dqbuf(in)) */
+			/* We use in_idx_pending set below when OPE output was dequeued */
+			/* For now feed into the slot that was freed by the last OPE cycle */
+			/* This is handled below after dqbuf(in) */
+			(void)cap_qbuf_ns; /* used below */
+			/* Store cidx temporarily — consumed when we have a free OPE slot */
+			/* Simple approach: process capture event only when OPE output also ready */
+			/* If only capture is ready (no OPE output yet), just note it */
+			(void)cidx;
+			/* Re-queue capture buf immediately if OPE output not ready yet */
+			if (!(pfds[0].revents & POLLIN)) {
+				capture_qbuf(&cap_ctx, cidx);
+				continue;
+			}
+			/* Both ready — fall through to OPE output handling below,
+			 * using this cidx for the requeue */
+			/* Store for use in the OPE output section */
+			cap_buf_for_ope_slot[0] = cidx; /* temporary, overwritten below */
+		}
+
+		/* --- OPE output fd ready --- */
+		if (!(pfds[0].revents & POLLIN))
+			continue;
+
 		int params_buf = -1;
 
-		/* Dequeue output */
+		/* Dequeue OPE output */
 		uint32_t out_idx;
 		uint32_t out_seq;
 		if (vnode_dqbuf(&out_ctx, &out_idx, &out_seq) < 0) {
@@ -736,14 +781,14 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		}
 		uint64_t done_ns = now_ns();
 
-		/* Dequeue input */
+		/* Dequeue OPE input (returns the slot that just finished) */
 		uint32_t in_idx;
 		if (vnode_dqbuf(&in_ctx, &in_idx, NULL) < 0) {
 			perror("VIDIOC_DQBUF input");
 			goto out_streamoff;
 		}
 
-		/* Grow timing array if needed (duration mode) */
+		/* Grow timing arrays if needed */
 		if (frames_done >= frame_ns_cap) {
 			uint32_t new_cap = frame_ns_cap * 2;
 			uint64_t *tmp = realloc(frame_ns, new_cap * sizeof(*frame_ns));
@@ -760,7 +805,8 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (frames_done < frame_ns_cap)
 			frame_ns[frames_done] = done_ns - submit_ns[in_idx];
 		frames_done++;
-		/* Update params for next frame if requested */
+
+		/* Update params */
 		if (params_ctx.fd >= 0) {
 			struct params_config new_cfg;
 			struct params_config *refill = NULL;
@@ -804,20 +850,37 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (out_ns && frames_done - 1 < frame_ns_cap)
 			out_ns[frames_done - 1] = now_ns() - done_ns;
 
+		/* Re-queue output buffer to OPE immediately — before input requeue
+		 * which may block on capture_dqbuf */
+		if (vnode_qbuf(&out_ctx, out_idx) < 0) {
+			perror("VIDIOC_QBUF output requeue");
+			goto out_streamoff;
+		}
+
 		if (!cfg->duration_ms && frames_done >= cfg->num_frames)
 			break;
 
-		/* Re-queue input */
 		frame_num++;
+		/* Re-queue input: for capture path, get next camera frame and feed OPE;
+		 * for non-capture path, requeue the same buffer. */
 		if (cfg->input_device) {
-			/* Return previous capture buffer, get next one */
+			/* Return the capture buffer that was just used by OPE */
+			int prev_cap = cap_buf_for_ope_slot[in_idx];
+			if (prev_cap >= 0)
+				capture_qbuf(&cap_ctx, prev_cap);
+			/* Get next camera frame (may already be ready from the poll above) */
 			uint64_t cap_qbuf_ns = now_ns();
-			if (cap_buf_idx >= 0)
-				capture_qbuf(&cap_ctx, cap_buf_idx);
-			int cidx = capture_dqbuf(&cap_ctx);
-			if (cidx < 0) {
-				perror("capture: VIDIOC_DQBUF requeue");
-				goto out_streamoff;
+			int cidx;
+			if (pfds[1].revents & POLLIN) {
+				/* Already dequeued above — use cap_buf_for_ope_slot[0] as temp */
+				cidx = cap_buf_for_ope_slot[0];
+			} else {
+				/* Need to wait for next capture frame */
+				cidx = capture_dqbuf(&cap_ctx);
+				if (cidx < 0) {
+					perror("capture: VIDIOC_DQBUF requeue");
+					goto out_streamoff;
+				}
 			}
 			submit_ns[in_idx] = now_ns();
 			if (capture_ns && frames_done - 1 < frame_ns_cap)
@@ -826,17 +889,13 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				perror("VIDIOC_QBUF input dmabuf requeue");
 				goto out_streamoff;
 			}
-			cap_buf_idx = cidx;
+			cap_buf_for_ope_slot[in_idx] = cidx;
 		} else {
 			submit_ns[in_idx] = now_ns();
 			if (vnode_qbuf(&in_ctx, in_idx) < 0) {
 				perror("VIDIOC_QBUF input requeue");
 				goto out_streamoff;
 			}
-		}
-		if (vnode_qbuf(&out_ctx, out_idx) < 0) {
-			perror("VIDIOC_QBUF output requeue");
-			goto out_streamoff;
 		}
 	}
 
