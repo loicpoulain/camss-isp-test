@@ -21,6 +21,194 @@
 
 #define MAX_PIPELINE_BUFS 3
 
+/* ---- Live capture device context ------------------------------------ */
+
+struct capture_ctx {
+	int          fd;
+	const char  *label;
+	uint32_t     type;       /* V4L2_BUF_TYPE_VIDEO_CAPTURE or _MPLANE */
+	uint32_t     fourcc;
+	uint32_t     width;
+	uint32_t     height;
+	uint32_t     sizeimage;
+	unsigned int buf_count;
+	int          dmabuf_fds[MAX_PIPELINE_BUFS]; /* exported dmabuf fds */
+};
+
+static void capture_ctx_close(struct capture_ctx *c)
+{
+	if (c->fd < 0)
+		return;
+	for (unsigned int i = 0; i < c->buf_count; i++)
+		if (c->dmabuf_fds[i] >= 0)
+			close(c->dmabuf_fds[i]);
+	close(c->fd);
+	c->fd = -1;
+}
+
+static int capture_open(const char *devnode, uint32_t fourcc,
+			uint32_t width, uint32_t height,
+			unsigned int depth, struct capture_ctx *c)
+{
+	struct v4l2_format fmt = {};
+	struct v4l2_requestbuffers req = {};
+	int ret;
+
+	memset(c, 0, sizeof(*c));
+	c->fd = -1;
+	for (unsigned int i = 0; i < MAX_PIPELINE_BUFS; i++)
+		c->dmabuf_fds[i] = -1;
+
+	c->fd = open(devnode, O_RDWR | O_CLOEXEC);
+	if (c->fd < 0) {
+		fprintf(stderr, "capture: open %s: %s\n", devnode, strerror(errno));
+		return -1;
+	}
+	c->label = devnode;
+
+	/* Try multiplanar first, fall back to singleplanar */
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	if (ioctl(c->fd, VIDIOC_G_FMT, &fmt) < 0) {
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		if (ioctl(c->fd, VIDIOC_G_FMT, &fmt) < 0) {
+			fprintf(stderr, "capture: VIDIOC_G_FMT: %s\n", strerror(errno));
+			goto err;
+		}
+	}
+	c->type = fmt.type;
+
+	/* Override format/size if caller specified them */
+	if (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		if (fourcc) fmt.fmt.pix_mp.pixelformat = fourcc;
+		if (width)  fmt.fmt.pix_mp.width        = width;
+		if (height) fmt.fmt.pix_mp.height       = height;
+		fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+		ret = ioctl(c->fd, VIDIOC_S_FMT, &fmt);
+		if (ret < 0) {
+			fprintf(stderr, "capture: VIDIOC_S_FMT: %s\n", strerror(errno));
+			goto err;
+		}
+		c->fourcc    = fmt.fmt.pix_mp.pixelformat;
+		c->width     = fmt.fmt.pix_mp.width;
+		c->height    = fmt.fmt.pix_mp.height;
+		c->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+	} else {
+		if (fourcc) fmt.fmt.pix.pixelformat = fourcc;
+		if (width)  fmt.fmt.pix.width       = width;
+		if (height) fmt.fmt.pix.height      = height;
+		fmt.fmt.pix.field = V4L2_FIELD_NONE;
+		ret = ioctl(c->fd, VIDIOC_S_FMT, &fmt);
+		if (ret < 0) {
+			fprintf(stderr, "capture: VIDIOC_S_FMT: %s\n", strerror(errno));
+			goto err;
+		}
+		c->fourcc    = fmt.fmt.pix.pixelformat;
+		c->width     = fmt.fmt.pix.width;
+		c->height    = fmt.fmt.pix.height;
+		c->sizeimage = fmt.fmt.pix.sizeimage;
+	}
+
+	printf("  %-6s  %s  %ux%u %.4s  size=%u\n",
+	       "Capture", devnode, c->width, c->height,
+	       (char *)&c->fourcc, c->sizeimage);
+
+	/* Allocate MMAP buffers so we can export them as dmabuf */
+	req.type   = c->type;
+	req.memory = V4L2_MEMORY_MMAP;
+	req.count  = depth;
+	ret = ioctl(c->fd, VIDIOC_REQBUFS, &req);
+	if (ret < 0) {
+		fprintf(stderr, "capture: VIDIOC_REQBUFS: %s\n", strerror(errno));
+		goto err;
+	}
+	c->buf_count = req.count;
+
+	/* Export each buffer as a dmabuf fd */
+	printf("\nBuffers:\n");
+	for (unsigned int i = 0; i < c->buf_count; i++) {
+		struct v4l2_exportbuffer expbuf = {
+			.type  = c->type,
+			.index = i,
+			.plane = 0,
+			.flags = O_CLOEXEC,
+		};
+		ret = ioctl(c->fd, VIDIOC_EXPBUF, &expbuf);
+		if (ret < 0) {
+			fprintf(stderr, "capture: VIDIOC_EXPBUF %u: %s\n",
+				i, strerror(errno));
+			goto err;
+		}
+		c->dmabuf_fds[i] = expbuf.fd;
+
+		/* Query offset for display */
+		struct v4l2_buffer qbuf = { .type = c->type, .memory = V4L2_MEMORY_MMAP, .index = i };
+		struct v4l2_plane planes[1] = {};
+		if (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+			qbuf.m.planes = planes;
+			qbuf.length   = 1;
+		}
+		ioctl(c->fd, VIDIOC_QUERYBUF, &qbuf);
+		uint32_t offset = (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+			? planes[0].m.mem_offset : qbuf.m.offset;
+		uint32_t length = (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+			? planes[0].length : qbuf.length;
+		printf("  %-14s  buf[%u]  offset=0x%08x  length=%-8u  dmabuf_fd=%d\n",
+		       devnode, i, offset, length, expbuf.fd);
+	}
+
+	/* Queue all buffers and stream on */
+	for (unsigned int i = 0; i < c->buf_count; i++) {
+		struct v4l2_buffer qbuf = { .type = c->type, .memory = V4L2_MEMORY_MMAP, .index = i };
+		struct v4l2_plane planes[1] = {};
+		if (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+			qbuf.m.planes = planes;
+			qbuf.length   = 1;
+		}
+		ret = ioctl(c->fd, VIDIOC_QBUF, &qbuf);
+		if (ret < 0) {
+			fprintf(stderr, "capture: VIDIOC_QBUF %u: %s\n", i, strerror(errno));
+			goto err;
+		}
+	}
+
+	ret = ioctl(c->fd, VIDIOC_STREAMON, &c->type);
+	if (ret < 0) {
+		fprintf(stderr, "capture: VIDIOC_STREAMON: %s\n", strerror(errno));
+		goto err;
+	}
+
+	return 0;
+err:
+	capture_ctx_close(c);
+	return -1;
+}
+
+/* Dequeue from capture device, return buffer index */
+static int capture_dqbuf(struct capture_ctx *c)
+{
+	struct v4l2_buffer buf = { .type = c->type, .memory = V4L2_MEMORY_MMAP };
+	struct v4l2_plane planes[1] = {};
+	if (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		buf.m.planes = planes;
+		buf.length   = 1;
+	}
+	if (ioctl(c->fd, VIDIOC_DQBUF, &buf) < 0)
+		return -1;
+	return (int)buf.index;
+}
+
+/* Return a capture buffer back to the capture device */
+static int capture_qbuf(struct capture_ctx *c, unsigned int idx)
+{
+	struct v4l2_buffer buf = { .type = c->type, .memory = V4L2_MEMORY_MMAP, .index = idx };
+	struct v4l2_plane planes[1] = {};
+	if (c->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+		buf.m.planes = planes;
+		buf.length   = 1;
+	}
+	return ioctl(c->fd, VIDIOC_QBUF, &buf);
+}
+
 struct vnode_ctx {
 	int      fd;
 	const char *label;
@@ -44,6 +232,22 @@ static void vnode_ctx_close(struct vnode_ctx *v)
 	}
 	close(v->fd);
 	v->fd = -1;
+}
+
+/* Queue one dmabuf fd to the OPE input queue (V4L2_MEMORY_DMABUF) */
+static int ope_in_qbuf_dmabuf(struct vnode_ctx *v, unsigned int idx, int dmabuf_fd)
+{
+	struct v4l2_buffer buf = {
+		.type   = v->type,
+		.memory = V4L2_MEMORY_DMABUF,
+		.index  = idx,
+	};
+	struct v4l2_plane planes[1] = {{ .m.fd = dmabuf_fd,
+					 .length   = v->sizeimage,
+					 .bytesused = v->sizeimage }};
+	buf.m.planes = planes;
+	buf.length   = 1;
+	return ioctl(v->fd, VIDIOC_QBUF, &buf);
 }
 
 static int vnode_open_and_set_fmt(struct vnode_ctx *v, const char *devnode,
@@ -188,28 +392,36 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static void print_timing_summary(const uint64_t *frame_ns, uint32_t count,
-				  uint64_t wall_ns)
+static void print_latency_row(const char *label, const uint64_t *ns, uint32_t count)
 {
 	uint64_t total = 0, min = UINT64_MAX, max = 0;
 
 	for (uint32_t i = 0; i < count; i++) {
-		total += frame_ns[i];
-		if (frame_ns[i] < min) min = frame_ns[i];
-		if (frame_ns[i] > max) max = frame_ns[i];
+		total += ns[i];
+		if (ns[i] < min) min = ns[i];
+		if (ns[i] > max) max = ns[i];
 	}
 
-	double min_ms  = (double)min   / 1e6;
-	double max_ms  = (double)max   / 1e6;
-	double avg_ms  = (double)total / 1e6 / count;
+	double min_ms = (double)min   / 1e6;
+	double max_ms = (double)max   / 1e6;
+	double avg_ms = (double)total / 1e6 / count;
 
+	printf("  %-22s min=%.3f ms  max=%.3f ms  avg=%.3f ms\n",
+	       label, min_ms, max_ms, avg_ms);
+	printf("  %-22s (%.1f fps)     (%.1f fps)     (%.1f fps)\n",
+	       "", 1e3 / min_ms, 1e3 / max_ms, 1e3 / avg_ms);
+}
+
+static void print_timing_summary(const uint64_t *frame_ns,
+				  const uint64_t *capture_ns,
+				  uint32_t count, uint64_t wall_ns)
+{
 	printf("\nResults:\n");
 	printf("  Throughput   %u frames   %.1f fps\n",
 	       count, 1e9 * count / (double)wall_ns);
-	printf("  Latency      min=%.3f ms  max=%.3f ms  avg=%.3f ms\n",
-	       min_ms, max_ms, avg_ms);
-	printf("               (%.1f fps)     (%.1f fps)     (%.1f fps)\n",
-	       1e3 / min_ms, 1e3 / max_ms, 1e3 / avg_ms);
+	if (capture_ns)
+		print_latency_row("Cap latency", capture_ns, count);
+	print_latency_row("Proc latency", frame_ns, count);
 }
 
 /* Fill input buffer with a simple Bayer gradient pattern */
@@ -251,6 +463,8 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 {
 	struct vnode_ctx in_ctx  = { .fd = -1 };
 	struct vnode_ctx out_ctx = { .fd = -1 };
+	struct capture_ctx cap_ctx = { .fd = -1 };
+	int cap_buf_idx = -1; /* capture buffer currently held by OPE */
 	struct isp_vnode *in_vn, *out_vn, *params_vn;
 	struct params_ctx params_ctx = { .fd = -1 };
 	struct params_config *params_cfgs = NULL;
@@ -258,6 +472,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	int out_file_fd = -1;
 	uint64_t submit_ns[MAX_PIPELINE_BUFS] = {};
 	uint64_t *frame_ns = NULL;
+	uint64_t *capture_ns = NULL;
 
 	uint32_t out_w = cfg->output_width  ? cfg->output_width  : cfg->width;
 	uint32_t out_h = cfg->output_height ? cfg->output_height : cfg->height;
@@ -306,6 +521,14 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
 	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
+
+	/* Open live capture device if requested */
+	if (cfg->input_device) {
+		if (capture_open(cfg->input_device,
+				 cfg->input_fmt, cfg->width, cfg->height,
+				 depth, &cap_ctx) < 0)
+			goto out;
+	}
 	if (depth > MAX_PIPELINE_BUFS) depth = MAX_PIPELINE_BUFS;
 	if (!cfg->duration_ms && depth > cfg->num_frames) depth = cfg->num_frames;
 
@@ -327,16 +550,39 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		}
 	}
 
-	printf("\nBuffers:\n");
-	int in_nbufs  = vnode_alloc_bufs(&in_ctx,  depth);
+	if (!cfg->input_device)
+		printf("\nBuffers:\n");
+	int in_nbufs = 0;
+	if (!cfg->input_device) {
+		in_nbufs = vnode_alloc_bufs(&in_ctx, depth);
+		if (in_nbufs < 0)
+			goto out;
+	} else {
+		/* OPE input uses DMABUF — just REQBUFS with count=depth, no mmap */
+		struct v4l2_requestbuffers req = {
+			.type   = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+			.memory = V4L2_MEMORY_DMABUF,
+			.count  = depth,
+		};
+		if (ioctl(in_ctx.fd, VIDIOC_REQBUFS, &req) < 0) {
+			perror("VIDIOC_REQBUFS input dmabuf");
+			goto out;
+		}
+		in_nbufs = (int)req.count;
+	}
 	int out_nbufs = vnode_alloc_bufs(&out_ctx, depth);
-	if (in_nbufs < 0 || out_nbufs < 0)
+	if (out_nbufs < 0)
 		goto out;
 
 	uint32_t frame_ns_cap = cfg->duration_ms ? 4096 : cfg->num_frames;
 	frame_ns = calloc(frame_ns_cap, sizeof(*frame_ns));
 	if (!frame_ns)
 		goto out;
+	if (cfg->input_device) {
+		capture_ns = calloc(frame_ns_cap, sizeof(*capture_ns));
+		if (!capture_ns)
+			goto out;
+	}
 
 	/* Load or generate input frames */
 	int input_fd = -1;
@@ -364,21 +610,35 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	 * timing; higher values increase throughput but timestamps reflect
 	 * STREAMON time for all pre-queued buffers. */
 	for (int i = 0; i < (int)depth; i++) {
-		if (input_fd >= 0) {
-			ssize_t n = read(input_fd, in_ctx.bufs[i],
-					 in_ctx.sizeimage);
-			if (n < (ssize_t)in_ctx.sizeimage)
+		if (cfg->input_device) {
+			/* Dqbuf one frame from capture, submit as dmabuf to OPE */
+			int cidx = capture_dqbuf(&cap_ctx);
+			if (cidx < 0) {
+				perror("capture: VIDIOC_DQBUF pre-queue");
+				goto out;
+			}
+			if (ope_in_qbuf_dmabuf(&in_ctx, i, cap_ctx.dmabuf_fds[cidx]) < 0) {
+				perror("VIDIOC_QBUF input dmabuf");
+				goto out;
+			}
+			cap_buf_idx = cidx;
+		} else {
+			if (input_fd >= 0) {
+				ssize_t n = read(input_fd, in_ctx.bufs[i],
+						 in_ctx.sizeimage);
+				if (n < (ssize_t)in_ctx.sizeimage)
+					fill_bayer_pattern(in_ctx.bufs[i],
+							   in_ctx.width, in_ctx.height,
+							   in_ctx.bytesperline, i);
+			} else {
 				fill_bayer_pattern(in_ctx.bufs[i],
 						   in_ctx.width, in_ctx.height,
 						   in_ctx.bytesperline, i);
-		} else {
-			fill_bayer_pattern(in_ctx.bufs[i],
-					   in_ctx.width, in_ctx.height,
-					   in_ctx.bytesperline, i);
-		}
-		if (vnode_qbuf(&in_ctx, i) < 0) {
-			perror("VIDIOC_QBUF input");
-			goto out;
+			}
+			if (vnode_qbuf(&in_ctx, i) < 0) {
+				perror("VIDIOC_QBUF input");
+				goto out;
+			}
 		}
 	}
 
@@ -460,6 +720,10 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			uint32_t new_cap = frame_ns_cap * 2;
 			uint64_t *tmp = realloc(frame_ns, new_cap * sizeof(*frame_ns));
 			if (tmp) { frame_ns = tmp; frame_ns_cap = new_cap; }
+			if (capture_ns) {
+				tmp = realloc(capture_ns, new_cap * sizeof(*capture_ns));
+				if (tmp) capture_ns = tmp;
+			}
 		}
 		if (frames_done < frame_ns_cap)
 			frame_ns[frames_done] = done_ns - submit_ns[in_idx];
@@ -502,12 +766,32 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (!cfg->duration_ms && frames_done >= cfg->num_frames)
 			break;
 
-		/* Re-queue input (pattern was filled once at init) */
+		/* Re-queue input */
 		frame_num++;
-		submit_ns[in_idx] = now_ns();
-		if (vnode_qbuf(&in_ctx, in_idx) < 0) {
-			perror("VIDIOC_QBUF input requeue");
-			goto out_streamoff;
+		if (cfg->input_device) {
+			/* Return previous capture buffer, get next one */
+			uint64_t cap_qbuf_ns = now_ns();
+			if (cap_buf_idx >= 0)
+				capture_qbuf(&cap_ctx, cap_buf_idx);
+			int cidx = capture_dqbuf(&cap_ctx);
+			if (cidx < 0) {
+				perror("capture: VIDIOC_DQBUF requeue");
+				goto out_streamoff;
+			}
+			submit_ns[in_idx] = now_ns();
+			if (capture_ns && frames_done - 1 < frame_ns_cap)
+				capture_ns[frames_done - 1] = submit_ns[in_idx] - cap_qbuf_ns;
+			if (ope_in_qbuf_dmabuf(&in_ctx, in_idx, cap_ctx.dmabuf_fds[cidx]) < 0) {
+				perror("VIDIOC_QBUF input dmabuf requeue");
+				goto out_streamoff;
+			}
+			cap_buf_idx = cidx;
+		} else {
+			submit_ns[in_idx] = now_ns();
+			if (vnode_qbuf(&in_ctx, in_idx) < 0) {
+				perror("VIDIOC_QBUF input requeue");
+				goto out_streamoff;
+			}
 		}
 		if (vnode_qbuf(&out_ctx, out_idx) < 0) {
 			perror("VIDIOC_QBUF output requeue");
@@ -517,9 +801,12 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 	ret = 0;
 	uint64_t streamoff_ns = now_ns();
-	print_timing_summary(frame_ns, frames_done, streamoff_ns - streamon_ns);
+	print_timing_summary(frame_ns, capture_ns, frames_done, streamoff_ns - streamon_ns);
 
 out_streamoff:
+	if (cfg->input_device) {
+		ioctl(cap_ctx.fd, VIDIOC_STREAMOFF, &cap_ctx.type);
+	}
 	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	ioctl(in_ctx.fd, VIDIOC_STREAMOFF, &type);
 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -532,9 +819,11 @@ out:
 	params_close(&params_ctx);
 	free(params_cfgs);
 
+	capture_ctx_close(&cap_ctx);
 	vnode_ctx_close(&in_ctx);
 	vnode_ctx_close(&out_ctx);
 	free(frame_ns);
+	free(capture_ns);
 	return ret;
 }
 

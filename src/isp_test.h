@@ -27,6 +27,9 @@
  * @duration_ms:       run for this many milliseconds instead of num_frames
  *                     (0 = use num_frames). Per-frame prints are suppressed;
  *                     only the summary is printed at the end.
+ * @input_device:      path to a live V4L2 capture device to use as input
+ *                     (NULL = use input_file or generated pattern).
+ *                     Format is queried from the device; -f/-s can override.
  */
 struct frame_config {
 	uint32_t    input_fmt;
@@ -43,6 +46,7 @@ struct frame_config {
 	unsigned int framerate;
 	int          randomize_params;
 	uint32_t     duration_ms;
+	const char  *input_device;
 };
 
 /**

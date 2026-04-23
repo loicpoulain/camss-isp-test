@@ -44,6 +44,7 @@ static void usage(const char *prog)
 		"  -e              Enumerate formats on all vnodes and exit\n"
 		"  -t              Print media topology and exit\n"
 		"  -i <file>       Input raw Bayer frame file\n"
+		"  -I <device>     Live V4L2 capture device as input (e.g. /dev/video0)\n"
 		"  -o <file>       Output raw YUV frame file\n"
 		"  -s <WxH>        Input size  (default: 640x480)\n"
 		"  -S <WxH>        Output size (default: same as input)\n"
@@ -89,11 +90,12 @@ int main(int argc, char *argv[])
 	int do_topology = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "eti:o:s:S:f:F:n:T:d:r:pP:Rh")) != -1) {
+	while ((opt = getopt(argc, argv, "eti:I:o:s:S:f:F:n:T:d:r:pP:Rh")) != -1) {
 		switch (opt) {
 		case 'e': do_enum     = 1; break;
 		case 't': do_topology = 1; break;
 		case 'i': cfg.input_file  = optarg; break;
+		case 'I': cfg.input_device = optarg; break;
 		case 'o': cfg.output_file = optarg; break;
 		case 's': {
 			unsigned int w = 0, h = 0;
