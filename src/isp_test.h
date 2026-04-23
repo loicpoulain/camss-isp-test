@@ -30,6 +30,8 @@
  * @input_device:      path to a live V4L2 capture device to use as input
  *                     (NULL = use input_file or generated pattern).
  *                     Format is queried from the device; -f/-s can override.
+ * @gst_pipeline:      GStreamer sink pipeline string appended after appsrc
+ *                     (NULL = disabled). Requires HAVE_GSTREAMER.
  */
 struct frame_config {
 	uint32_t    input_fmt;
@@ -47,6 +49,7 @@ struct frame_config {
 	int          randomize_params;
 	uint32_t     duration_ms;
 	const char  *input_device;
+	const char  *gst_pipeline;
 };
 
 /**

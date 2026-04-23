@@ -25,6 +25,7 @@
  *   -R              Randomize params buffer before each frame (implies -p)
  */
 #include <getopt.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,9 @@
 
 #include "media.h"
 #include "isp_test.h"
+#ifdef HAVE_GSTREAMER
+#include <gst/gst.h>
+#endif
 #include "params.h"
 
 static void usage(const char *prog)
@@ -44,8 +48,9 @@ static void usage(const char *prog)
 		"  -e              Enumerate formats on all vnodes and exit\n"
 		"  -t              Print media topology and exit\n"
 		"  -i <file>       Input raw Bayer frame file\n"
-		"  -I <device>     Live V4L2 capture device as input (e.g. /dev/video0)\n"
+		"  -I <device>     Live V4L2 capture device as input\n"
 		"  -o <file>       Output raw YUV frame file\n"
+		"  -g <pipeline>   GStreamer sink pipeline (e.g. \"videoconvert ! autovideosink\")\n"
 		"  -s <WxH>        Input size  (default: 640x480)\n"
 		"  -S <WxH>        Output size (default: same as input)\n"
 		"  -f <fourcc>     Input fourcc  (default: RGGB)\n"
@@ -72,6 +77,14 @@ static uint32_t parse_fourcc(const char *s)
 	return v4l2_fourcc(s[0], s[1], s[2], s[3]);
 }
 
+volatile sig_atomic_t g_interrupted;
+
+static void sigint_handler(int sig)
+{
+	(void)sig;
+	g_interrupted = 1;
+}
+
 int main(int argc, char *argv[])
 {
 	struct isp_pipeline pipe;
@@ -90,13 +103,19 @@ int main(int argc, char *argv[])
 	int do_topology = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "eti:I:o:s:S:f:F:n:T:d:r:pP:Rh")) != -1) {
+	while ((opt = getopt(argc, argv, "eti:I:o:g:s:S:f:F:n:T:d:r:pP:Rh")) != -1) {
 		switch (opt) {
 		case 'e': do_enum     = 1; break;
 		case 't': do_topology = 1; break;
 		case 'i': cfg.input_file  = optarg; break;
 		case 'I': cfg.input_device = optarg; break;
 		case 'o': cfg.output_file = optarg; break;
+		case 'g':
+#ifdef HAVE_GSTREAMER
+			cfg.gst_pipeline = optarg; break;
+#else
+			fprintf(stderr, "GStreamer support not compiled in\n"); return 1;
+#endif
 		case 's': {
 			unsigned int w = 0, h = 0;
 			if (sscanf(optarg, "%ux%u", &w, &h) == 2) {
@@ -165,6 +184,11 @@ int main(int argc, char *argv[])
 	media_pipeline_print(&pipe);
 
 	/* Run the streaming test */
+#ifdef HAVE_GSTREAMER
+	if (cfg.gst_pipeline)
+		gst_init(NULL, NULL);
+#endif
+	signal(SIGINT, sigint_handler);
 	int ret = isp_test_run(&pipe, &cfg);
 
 	media_pipeline_close(&pipe);

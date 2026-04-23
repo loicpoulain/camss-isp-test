@@ -10,12 +10,18 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <linux/videodev2.h>
 
 #include "isp_test.h"
+
+extern volatile sig_atomic_t g_interrupted;
+#ifdef HAVE_GSTREAMER
+#include "gst_sink.h"
+#endif
 #include "media.h"
 #include "params.h"
 
@@ -414,6 +420,7 @@ static void print_latency_row(const char *label, const uint64_t *ns, uint32_t co
 
 static void print_timing_summary(const uint64_t *frame_ns,
 				  const uint64_t *capture_ns,
+				  const uint64_t *out_ns,
 				  uint32_t count, uint64_t wall_ns)
 {
 	printf("\nResults:\n");
@@ -422,6 +429,7 @@ static void print_timing_summary(const uint64_t *frame_ns,
 	if (capture_ns)
 		print_latency_row("Cap latency", capture_ns, count);
 	print_latency_row("Proc latency", frame_ns, count);
+	print_latency_row("Out latency", out_ns, count);
 }
 
 /* Fill input buffer with a simple Bayer gradient pattern */
@@ -470,9 +478,13 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	struct params_config *params_cfgs = NULL;
 	int ret = -1;
 	int out_file_fd = -1;
+#ifdef HAVE_GSTREAMER
+	struct gst_sink *gst = NULL;
+#endif
 	uint64_t submit_ns[MAX_PIPELINE_BUFS] = {};
 	uint64_t *frame_ns = NULL;
 	uint64_t *capture_ns = NULL;
+	uint64_t *out_ns = NULL;
 
 	uint32_t out_w = cfg->output_width  ? cfg->output_width  : cfg->width;
 	uint32_t out_h = cfg->output_height ? cfg->output_height : cfg->height;
@@ -518,6 +530,15 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				   cfg->output_width  ? cfg->output_width  : cfg->width,
 				   cfg->output_height ? cfg->output_height : cfg->height) < 0)
 		goto out;
+
+#ifdef HAVE_GSTREAMER
+	if (cfg->gst_pipeline) {
+		gst = gst_sink_open(out_w, out_h, cfg->output_fmt,
+				    cfg->framerate, cfg->gst_pipeline);
+		if (!gst)
+			goto out;
+	}
+#endif
 
 	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
 	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
@@ -583,6 +604,9 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (!capture_ns)
 			goto out;
 	}
+	out_ns = calloc(frame_ns_cap, sizeof(*out_ns));
+	if (!out_ns)
+		goto out;
 
 	/* Load or generate input frames */
 	int input_fd = -1;
@@ -624,6 +648,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			cap_buf_idx = cidx;
 		} else {
 			if (input_fd >= 0) {
+				lseek(input_fd, 0, SEEK_SET);
 				ssize_t n = read(input_fd, in_ctx.bufs[i],
 						 in_ctx.sizeimage);
 				if (n < (ssize_t)in_ctx.sizeimage)
@@ -679,8 +704,9 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		? streamon_ns + (uint64_t)cfg->duration_ms * 1000000ULL
 		: 0;
 
-	while (cfg->duration_ms ? now_ns() < deadline_ns
-	                        : frames_done < cfg->num_frames) {
+	while (!g_interrupted &&
+	       (cfg->duration_ms ? now_ns() < deadline_ns
+	                         : frames_done < cfg->num_frames)) {
 		/* Poll for output buffer ready */
 		struct pollfd pfd = {
 			.fd     = out_ctx.fd,
@@ -688,6 +714,8 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		};
 		int pret = poll(&pfd, 1, 2000);
 		if (pret < 0) {
+			if (errno == EINTR)
+				break;
 			perror("poll");
 			goto out_streamoff;
 		}
@@ -724,6 +752,10 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				tmp = realloc(capture_ns, new_cap * sizeof(*capture_ns));
 				if (tmp) capture_ns = tmp;
 			}
+			if (out_ns) {
+				tmp = realloc(out_ns, new_cap * sizeof(*out_ns));
+				if (tmp) out_ns = tmp;
+			}
 		}
 		if (frames_done < frame_ns_cap)
 			frame_ns[frames_done] = done_ns - submit_ns[in_idx];
@@ -752,6 +784,12 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				       frame_ms, 1000.0 / frame_ms);
 		}
 
+#ifdef HAVE_GSTREAMER
+		if (gst)
+			gst_sink_push(gst, out_ctx.bufs[out_idx],
+				      out_ctx.sizeimage, done_ns);
+#endif
+
 		/* Save output frame */
 		if (out_file_fd >= 0 && frames_done == 1) {
 			ssize_t n = write(out_file_fd, out_ctx.bufs[out_idx],
@@ -762,6 +800,9 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				printf("  saved output frame to %s\n",
 				       cfg->output_file);
 		}
+
+		if (out_ns && frames_done - 1 < frame_ns_cap)
+			out_ns[frames_done - 1] = now_ns() - done_ns;
 
 		if (!cfg->duration_ms && frames_done >= cfg->num_frames)
 			break;
@@ -801,7 +842,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 	ret = 0;
 	uint64_t streamoff_ns = now_ns();
-	print_timing_summary(frame_ns, capture_ns, frames_done, streamoff_ns - streamon_ns);
+	print_timing_summary(frame_ns, capture_ns, out_ns, frames_done, streamoff_ns - streamon_ns);
 
 out_streamoff:
 	if (cfg->input_device) {
@@ -816,6 +857,9 @@ out:
 	if (input_fd >= 0)    close(input_fd);
 	if (out_file_fd >= 0) close(out_file_fd);
 
+#ifdef HAVE_GSTREAMER
+	gst_sink_close(gst);
+#endif
 	params_close(&params_ctx);
 	free(params_cfgs);
 
@@ -824,6 +868,7 @@ out:
 	vnode_ctx_close(&out_ctx);
 	free(frame_ns);
 	free(capture_ns);
+	free(out_ns);
 	return ret;
 }
 
