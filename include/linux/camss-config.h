@@ -14,11 +14,11 @@
 #include <linux/types.h>
 #include <linux/media/v4l2-isp.h>
 
-/*
- * V4L2 meta-output format for CAMSS ISP parameter buffers.
- * TODO: move to videodev2.h once stabilised.
- */
-#define V4L2_META_FMT_CAMSS_PARAMS	v4l2_fourcc('Q', 'C', 'A', 'P')
+/* V4L2_META_FMT_QCOM_ISP_PARAMS is defined in videodev2.h;
+ * provide it here for builds against older system headers. */
+#ifndef V4L2_META_FMT_QCOM_ISP_PARAMS
+#define V4L2_META_FMT_QCOM_ISP_PARAMS	v4l2_fourcc('Q', 'C', 'I', 'P')
+#endif
 
 /**
  * enum camss_params_block_type - CAMSS ISP parameter block identifiers
@@ -28,10 +28,10 @@
  */
 enum camss_params_block_type {
 	CAMSS_PARAMS_WB_GAIN = 1,
-	CAMSS_PARAMS_DEMO    = 2,
+	CAMSS_PARAMS_CHROMA_ENHAN = 2,
+	CAMSS_PARAMS_COLOR_CORRECT = 3,
 	CAMSS_PARAMS_MAX,
 };
-
 
 /**
  * struct camss_params_wb_gain - White Balance gains
@@ -40,9 +40,6 @@ enum camss_params_block_type {
  * @g_gain:   green channel gain (Q5.10)
  * @b_gain:   blue channel gain (Q5.10)
  * @r_gain:   red channel gain (Q5.10)
- * @g_offset: green channel offset
- * @b_offset: blue channel offset
- * @r_offset: red channel offset
  */
 struct camss_params_wb_gain {
 	struct v4l2_isp_params_block_header header;
@@ -50,31 +47,75 @@ struct camss_params_wb_gain {
 	__u16 b_gain;
 	__u16 r_gain;
 	__u16 _pad;
-	__s32 g_offset;
-	__s32 b_offset;
-	__s32 r_offset;
 } __attribute__((aligned(8)));
 
 /**
- * struct camss_params_demo - Demosaic coefficients
+ * struct camss_params_chroma_enhan - RGB to YUV colour correction matrix
  *
- * @header:    generic block header; @header.type = CAMSS_PARAMS_DEMO
- * @lambda_rb: blue/red interpolation coefficient (Q8)
- * @lambda_g:  green interpolation coefficient (Q8)
- * @a_k:       edge detection noise offset (Q0)
- * @w_k:       edge detection weight (Q10)
+ * Implements the CLC_CHROMA_ENHAN pipeline module. All coefficients are
+ * signed 12-bit fixed-point Q3.8 (range roughly -8.0 to +7.996).
+ *
+ * Luma (Y) row of the matrix:
+ * @luma_v0:  R-to-Y coefficient (12sQ8, e.g. 0x04d = 0.299 BT.601)
+ * @luma_v1:  G-to-Y coefficient (12sQ8, e.g. 0x096 = 0.587 BT.601)
+ * @luma_v2:  B-to-Y coefficient (12sQ8, e.g. 0x01d = 0.114 BT.601)
+ * @luma_k:   Y output offset    (9sQ0,  0 = no offset)
+ *
+ * Chroma (Cb) row:
+ * @coeff_ap: Cb positive coefficient (12sQ8, e.g. 0x0e6 =  0.886 BT.601)
+ * @coeff_am: Cb negative coefficient (12sQ8, e.g. 0xfb3 = -0.338 BT.601)
+ * @kcb:      Cb output offset        (11s,   128 = +128)
+ *
+ * Chroma (Cr) row:
+ * @coeff_cp: Cr positive coefficient (12sQ8, e.g. 0x0b3 =  0.701 BT.601)
+ * @coeff_cm: Cr negative coefficient (12sQ8, e.g. 0xfe3 = -0.114 BT.601)
+ * @coeff_dp: Cr positive coefficient (12sQ8)
+ * @coeff_dm: Cr negative coefficient (12sQ8)
+ * @kcr:      Cr output offset        (11s,   128 = +128)
+ *
+ * @header: generic block header; @header.type = CAMSS_PARAMS_CHROMA_ENHAN
  */
-struct camss_params_demo {
+struct camss_params_chroma_enhan {
 	struct v4l2_isp_params_block_header header;
-	__u8  lambda_rb;
-	__u8  lambda_g;
-	__u16 a_k;
-	__u16 w_k;
-	__u16 _pad;
+	__u16 luma_v0;
+	__u16 luma_v1;
+	__u16 luma_v2;
+	__u16 luma_k;
+	__u16 coeff_ap;
+	__u16 coeff_am;
+	__u16 coeff_cp;
+	__u16 coeff_cm;
+	__u16 coeff_dp;
+	__u16 coeff_dm;
+	__u16 kcb;
+	__u16 kcr;
+} __attribute__((aligned(8)));
+
+/*
+ *
+ * signed 12-bit fixed-point (Qm)
+ *
+ * Out_ch0 (g) = A0*G+B0*B+C0*R + K0; 
+ * Out_ch1 (b) = A1*G+B1*B+C1*R + K1; 
+ * Out_ch2 (r) = A2*G+B2*B+C2*R + K2,
+ * 
+ * m = 0x0 - Coefficients are signed 12sQ7 numbers
+ * m = 0x1 - Coefficients are signed 12sQ8 numbers
+ * m = 0x2 - Coefficients are signed 12sQ9 numbers
+ * m = 0x3 - Coefficients are signed 12sQ10 numbers
+ */
+struct camss_params_color_correct {
+	struct v4l2_isp_params_block_header header;
+	__u16 a[3];
+	__u16 b[3];
+	__u16 c[3];
+	__u16 k[3];
+	__u16 m;
 } __attribute__((aligned(8)));
 
 #define CAMSS_PARAMS_MAX_PAYLOAD		\
 	(sizeof(struct camss_params_wb_gain)	+\
-	 sizeof(struct camss_params_demo))
+	 sizeof(struct camss_params_chroma_enhan)	+\
+	 sizeof(struct camss_params_color_correct))
 
 #endif /* _UAPI_LINUX_CAMSS_CONFIG_H */

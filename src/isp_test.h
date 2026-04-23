@@ -18,23 +18,31 @@
  * @input_file:   path to raw input frame file (NULL = generate pattern)
  * @output_file:  path to write output frame (NULL = discard)
  * @with_params:     enqueue a params buffer before streaming
- * @pipeline_depth:  input buffers to keep queued ahead (1..MAX_PIPELINE_BUFS,
- *                   default 1). Higher values increase throughput at the cost
- *                   of timing accuracy and extra frames on streamoff.
- * @framerate:        nominal frame rate in fps (0 = do not set, driver default).
- *                   Passed to the input vnode via VIDIOC_S_PARM.
+ * @pipeline_depth:   input buffers to keep queued ahead (1..MAX_PIPELINE_BUFS,
+ *                    default 1). Higher values increase throughput at the cost
+ *                    of timing accuracy and extra frames on streamoff.
+ * @framerate:         nominal frame rate in fps (0 = do not set, driver default).
+ *                    Passed to the input vnode via VIDIOC_S_PARM.
+ * @randomize_params:  randomize params buffer before each frame (implies -p).
+ * @duration_ms:       run for this many milliseconds instead of num_frames
+ *                     (0 = use num_frames). Per-frame prints are suppressed;
+ *                     only the summary is printed at the end.
  */
 struct frame_config {
 	uint32_t    input_fmt;
 	uint32_t    output_fmt;
 	uint32_t    width;
 	uint32_t    height;
+	uint32_t    output_width;   /* 0 = same as width */
+	uint32_t    output_height;  /* 0 = same as height */
 	uint32_t    num_frames;
 	const char *input_file;
 	const char *output_file;
 	int          with_params;
 	unsigned int pipeline_depth;
 	unsigned int framerate;
+	int          randomize_params;
+	uint32_t     duration_ms;
 };
 
 /**

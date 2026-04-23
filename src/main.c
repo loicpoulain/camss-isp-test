@@ -10,16 +10,19 @@
  *   -t              Print media topology and exit
  *   -i <file>       Input raw Bayer frame file (default: generated pattern)
  *   -o <file>       Output raw YUV frame file (default: discard)
- *   -W <width>      Frame width  (default: 640)
- *   -H <height>     Frame height (default: 480)
+ *   -s <WxH>        Input size  (default: 640x480)
+ *   -S <WxH>        Output size (default: same as input)
  *   -f <fourcc>     Input format fourcc (default: RGGB = V4L2_PIX_FMT_SRGGB8)
  *   -F <fourcc>     Output format fourcc (default: NV12)
  *   -n <count>      Number of frames to process (default: 1)
+ *   -T <seconds>    Run for a duration instead of frame count
  *   -p              Enqueue a params buffer (BLS + WB + DEMO defaults)
  *   -P <wb_g_gain>  White balance green gain Q5.10 (default: 1024)
  *   -h              Show this help
  *   -d <depth>      Input pipeline depth 1..3 (default: 1)
  *   -r <fps>        Frame rate in fps, sets VIDIOC_S_PARM (default: driver default)
+  -R              Randomize params before each frame (implies -p)
+ *   -R              Randomize params buffer before each frame (implies -p)
  */
 #include <getopt.h>
 #include <stdint.h>
@@ -42,15 +45,16 @@ static void usage(const char *prog)
 		"  -t              Print media topology and exit\n"
 		"  -i <file>       Input raw Bayer frame file\n"
 		"  -o <file>       Output raw YUV frame file\n"
-		"  -W <width>      Frame width  (default: 640)\n"
-		"  -H <height>     Frame height (default: 480)\n"
+		"  -s <WxH>        Input size  (default: 640x480)\n"
+		"  -S <WxH>        Output size (default: same as input)\n"
 		"  -f <fourcc>     Input fourcc  (default: RGGB)\n"
 		"  -F <fourcc>     Output fourcc (default: NV12)\n"
 		"  -n <count>      Number of frames (default: 1)\n"
-		"  -d <depth>      Input pipeline depth 1..3 (default: 1)\n"
-		"  -r <fps>        Frame rate in fps, sets VIDIOC_S_PARM (default: driver default)\n"
+		"  -T <seconds>    Run for a duration instead of frame count\n"
+		"  -d <depth>      Pipeline depth 1..3 (default: 1)\n"
+		"  -r <fps>        Frame rate in fps via VIDIOC_S_PARM\n"
 		"  -p              Enqueue params buffer with default values\n"
-		"  -P <wb_g_gain>  WB green gain Q5.10 (implies -p)\n"
+		"  -R              Randomize params before each frame (implies -p)\n"
 		"  -h              Show this help\n"
 		"\n"
 		"Supported input formats:  RGGB BGGR GBRG GRBG (8-bit plain)\n"
@@ -79,24 +83,47 @@ int main(int argc, char *argv[])
 		.with_params = 0,
 		.pipeline_depth = 1,
 		.framerate = 0,
+		.randomize_params = 0,
 	};
 	int do_enum     = 0;
 	int do_topology = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "eti:o:W:H:f:F:n:d:r:pP:h")) != -1) {
+	while ((opt = getopt(argc, argv, "eti:o:s:S:f:F:n:T:d:r:pP:Rh")) != -1) {
 		switch (opt) {
 		case 'e': do_enum     = 1; break;
 		case 't': do_topology = 1; break;
 		case 'i': cfg.input_file  = optarg; break;
 		case 'o': cfg.output_file = optarg; break;
-		case 'W': cfg.width       = (uint32_t)atoi(optarg); break;
-		case 'H': cfg.height      = (uint32_t)atoi(optarg); break;
+		case 's': {
+			unsigned int w = 0, h = 0;
+			if (sscanf(optarg, "%ux%u", &w, &h) == 2) {
+				cfg.width  = w;
+				cfg.height = h;
+			} else {
+				fprintf(stderr, "Invalid input size '%s', use WxH\n", optarg);
+				return 1;
+			}
+			break;
+		}
+		case 'S': {
+			unsigned int w = 0, h = 0;
+			if (sscanf(optarg, "%ux%u", &w, &h) == 2) {
+				cfg.output_width  = w;
+				cfg.output_height = h;
+			} else {
+				fprintf(stderr, "Invalid output size '%s', use WxH\n", optarg);
+				return 1;
+			}
+			break;
+		}
 		case 'f': cfg.input_fmt   = parse_fourcc(optarg); break;
 		case 'F': cfg.output_fmt  = parse_fourcc(optarg); break;
 		case 'n': cfg.num_frames  = (uint32_t)atoi(optarg); break;
+		case 'T': cfg.duration_ms = (uint32_t)(atof(optarg) * 1000); break;
 		case 'd': cfg.pipeline_depth = (unsigned int)atoi(optarg); break;
 		case 'r': cfg.framerate      = (unsigned int)atoi(optarg); break;
+		case 'R': cfg.randomize_params = 1; cfg.with_params = 1;   break;
 		case 'p': cfg.with_params = 1; break;
 		case 'P':
 			/* Custom WB green gain implies -p */

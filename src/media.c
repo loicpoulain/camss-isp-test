@@ -205,7 +205,7 @@ int media_find_ope_pipeline(struct isp_pipeline *pipe)
 
 void media_pipeline_print(const struct isp_pipeline *pipe)
 {
-	printf("\nOPE pipeline topology (%d video nodes):\n", pipe->num_vnodes);
+	printf("\nPipeline topology (%d video nodes):\n", pipe->num_vnodes);
 	printf("  %-30s  %-16s  %-8s  %s\n",
 	       "Name", "Device", "Dir", "Type");
 	printf("  %s\n", "--------------------------------------------------------------");

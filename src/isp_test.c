@@ -23,6 +23,7 @@
 
 struct vnode_ctx {
 	int      fd;
+	const char *label;
 	uint32_t type;       /* V4L2_BUF_TYPE_* */
 	uint32_t fmt;        /* fourcc */
 	uint32_t width;
@@ -52,6 +53,7 @@ static int vnode_open_and_set_fmt(struct vnode_ctx *v, const char *devnode,
 	struct v4l2_format fmt = {};
 	int ret;
 
+	v->label = devnode;
 	v->fd = open(devnode, O_RDWR | O_CLOEXEC);
 	if (v->fd < 0) {
 		fprintf(stderr, "open %s: %s\n", devnode, strerror(errno));
@@ -78,7 +80,8 @@ static int vnode_open_and_set_fmt(struct vnode_ctx *v, const char *devnode,
 	v->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	v->sizeimage    = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
-	printf("  %s: %ux%u %.4s bpl=%u size=%u\n",
+	printf("  %-6s  %s  %ux%u %.4s  bpl=%u  size=%u\n",
+	       V4L2_TYPE_IS_OUTPUT(type) ? "Input" : "Output",
 	       devnode, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
 	       (char *)&fmt.fmt.pix_mp.pixelformat,
 	       v->bytesperline, v->sizeimage);
@@ -125,6 +128,10 @@ static int vnode_alloc_bufs(struct vnode_ctx *v, unsigned int count)
 			perror("mmap");
 			return -1;
 		}
+
+		printf("  %-14s  buf[%u]  offset=0x%08x  length=%-8u  VA=%p\n",
+		       v->label ? v->label : "?", i, offset, length, v->bufs[i]);
+
 		v->buf_lengths[i] = length;
 	}
 
@@ -151,7 +158,7 @@ static int vnode_qbuf(struct vnode_ctx *v, uint32_t index)
 	return ioctl(v->fd, VIDIOC_QBUF, &buf);
 }
 
-static int vnode_dqbuf(struct vnode_ctx *v, uint32_t *index)
+static int vnode_dqbuf(struct vnode_ctx *v, uint32_t *index, uint32_t *sequence)
 {
 	struct v4l2_buffer buf = {
 		.type   = v->type,
@@ -168,6 +175,8 @@ static int vnode_dqbuf(struct vnode_ctx *v, uint32_t *index)
 		return -1;
 
 	*index = buf.index;
+	if (sequence)
+		*sequence = buf.sequence;
 	return 0;
 }
 
@@ -179,7 +188,8 @@ static uint64_t now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static void print_timing_summary(const uint64_t *frame_ns, uint32_t count)
+static void print_timing_summary(const uint64_t *frame_ns, uint32_t count,
+				  uint64_t wall_ns)
 {
 	uint64_t total = 0, min = UINT64_MAX, max = 0;
 
@@ -189,12 +199,17 @@ static void print_timing_summary(const uint64_t *frame_ns, uint32_t count)
 		if (frame_ns[i] > max) max = frame_ns[i];
 	}
 
-	printf("\n--- Frame processing time (qbuf-input -> dqbuf-output) ---\n");
-	printf("  frames : %u\n", count);
-	printf("  min    : %.3f ms  (%.1f fps)\n", (double)min   / 1e6, 1e9 / (double)min);
-	printf("  max    : %.3f ms  (%.1f fps)\n", (double)max   / 1e6, 1e9 / (double)max);
-	printf("  avg    : %.3f ms  (%.1f fps)\n", (double)total / 1e6 / count, 1e9 * count / (double)total);
-	printf("  total  : %.3f ms\n", (double)total / 1e6);
+	double min_ms  = (double)min   / 1e6;
+	double max_ms  = (double)max   / 1e6;
+	double avg_ms  = (double)total / 1e6 / count;
+
+	printf("\nResults:\n");
+	printf("  Throughput   %u frames   %.1f fps\n",
+	       count, 1e9 * count / (double)wall_ns);
+	printf("  Latency      min=%.3f ms  max=%.3f ms  avg=%.3f ms\n",
+	       min_ms, max_ms, avg_ms);
+	printf("               (%.1f fps)     (%.1f fps)     (%.1f fps)\n",
+	       1e3 / min_ms, 1e3 / max_ms, 1e3 / avg_ms);
 }
 
 /* Fill input buffer with a simple Bayer gradient pattern */
@@ -237,16 +252,25 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	struct vnode_ctx in_ctx  = { .fd = -1 };
 	struct vnode_ctx out_ctx = { .fd = -1 };
 	struct isp_vnode *in_vn, *out_vn, *params_vn;
-	int params_fd = -1;
+	struct params_ctx params_ctx = { .fd = -1 };
+	struct params_config *params_cfgs = NULL;
 	int ret = -1;
 	int out_file_fd = -1;
 	uint64_t submit_ns[MAX_PIPELINE_BUFS] = {};
 	uint64_t *frame_ns = NULL;
 
-	printf("\n=== ISP test: %ux%u %.4s -> %.4s (%u frames) ===\n",
-	       cfg->width, cfg->height,
-	       (char *)&cfg->input_fmt, (char *)&cfg->output_fmt,
-	       cfg->num_frames);
+	uint32_t out_w = cfg->output_width  ? cfg->output_width  : cfg->width;
+	uint32_t out_h = cfg->output_height ? cfg->output_height : cfg->height;
+	if (cfg->duration_ms)
+		printf("\nTest: %ux%u %.4s -> %ux%u %.4s  [%.1f s]\n",
+		       cfg->width, cfg->height, (char *)&cfg->input_fmt,
+		       out_w, out_h, (char *)&cfg->output_fmt,
+		       cfg->duration_ms / 1000.0);
+	else
+		printf("\nTest: %ux%u %.4s -> %ux%u %.4s  [%u frames]\n",
+		       cfg->width, cfg->height, (char *)&cfg->input_fmt,
+		       out_w, out_h, (char *)&cfg->output_fmt,
+		       cfg->num_frames);
 
 	/* Find vnodes */
 	in_vn     = media_find_vnode(pipe, "input");
@@ -275,32 +299,42 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	/* Open and configure output */
 	if (vnode_open_and_set_fmt(&out_ctx, out_vn->devnode,
 				   V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-				   cfg->output_fmt, cfg->width, cfg->height) < 0)
+				   cfg->output_fmt,
+				   cfg->output_width  ? cfg->output_width  : cfg->width,
+				   cfg->output_height ? cfg->output_height : cfg->height) < 0)
 		goto out;
+
+	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
+	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
+	if (depth > MAX_PIPELINE_BUFS) depth = MAX_PIPELINE_BUFS;
+	if (!cfg->duration_ms && depth > cfg->num_frames) depth = cfg->num_frames;
 
 	/* Open params vnode last so it joins the shared context */
 	if (cfg->with_params) {
 		if (!params_vn || !params_vn->devnode[0]) {
 			fprintf(stderr, "Warning: params vnode not found, continuing without\n");
 		} else {
-		struct params_config pcfg;
-		params_config_default(&pcfg);
-		params_fd = params_enqueue(params_vn->devnode, &pcfg);
-		if (params_fd < 0)
-			fprintf(stderr, "Warning: params enqueue failed, continuing without\n");
+		params_cfgs = calloc(depth, sizeof(*params_cfgs));
+		if (!params_cfgs) goto out;
+		for (unsigned int i = 0; i < depth; i++) {
+			params_config_default(&params_cfgs[i]);
+			if (cfg->randomize_params)
+				params_config_randomize(&params_cfgs[i]);
+		}
+		if (params_open(params_vn->devnode, depth, params_cfgs,
+				&params_ctx) < 0)
+			fprintf(stderr, "Warning: params open failed, continuing without\n");
 		}
 	}
 
-	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] and num_frames */
-	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
-	if (depth > MAX_PIPELINE_BUFS) depth = MAX_PIPELINE_BUFS;
-	if (depth > cfg->num_frames)   depth = cfg->num_frames;
+	printf("\nBuffers:\n");
 	int in_nbufs  = vnode_alloc_bufs(&in_ctx,  depth);
 	int out_nbufs = vnode_alloc_bufs(&out_ctx, depth);
 	if (in_nbufs < 0 || out_nbufs < 0)
 		goto out;
 
-	frame_ns = calloc(cfg->num_frames, sizeof(*frame_ns));
+	uint32_t frame_ns_cap = cfg->duration_ms ? 4096 : cfg->num_frames;
+	frame_ns = calloc(frame_ns_cap, sizeof(*frame_ns));
 	if (!frame_ns)
 		goto out;
 
@@ -373,12 +407,20 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	for (unsigned int i = 0; i < depth; i++)
 		submit_ns[i] = streamon_ns;
 
-	printf("Streaming started, processing %u frames...\n", cfg->num_frames);
+	if (cfg->duration_ms)
+		printf("\nStreaming  %.1f s...\n", cfg->duration_ms / 1000.0);
+	else
+		printf("\nStreaming  %u frames...\n", cfg->num_frames);
 
 	uint32_t frames_done = 0;
 	uint32_t frame_num   = 0;
 
-	while (frames_done < cfg->num_frames) {
+	uint64_t deadline_ns = cfg->duration_ms
+		? streamon_ns + (uint64_t)cfg->duration_ms * 1000000ULL
+		: 0;
+
+	while (cfg->duration_ms ? now_ns() < deadline_ns
+	                        : frames_done < cfg->num_frames) {
 		/* Poll for output buffer ready */
 		struct pollfd pfd = {
 			.fd     = out_ctx.fd,
@@ -395,9 +437,12 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			goto out_streamoff;
 		}
 
+		int params_buf = -1;
+
 		/* Dequeue output */
 		uint32_t out_idx;
-		if (vnode_dqbuf(&out_ctx, &out_idx) < 0) {
+		uint32_t out_seq;
+		if (vnode_dqbuf(&out_ctx, &out_idx, &out_seq) < 0) {
 			perror("VIDIOC_DQBUF output");
 			goto out_streamoff;
 		}
@@ -405,17 +450,43 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 		/* Dequeue input */
 		uint32_t in_idx;
-		if (vnode_dqbuf(&in_ctx, &in_idx) < 0) {
+		if (vnode_dqbuf(&in_ctx, &in_idx, NULL) < 0) {
 			perror("VIDIOC_DQBUF input");
 			goto out_streamoff;
 		}
 
-		frame_ns[frames_done] = done_ns - submit_ns[in_idx];
+		/* Grow timing array if needed (duration mode) */
+		if (frames_done >= frame_ns_cap) {
+			uint32_t new_cap = frame_ns_cap * 2;
+			uint64_t *tmp = realloc(frame_ns, new_cap * sizeof(*frame_ns));
+			if (tmp) { frame_ns = tmp; frame_ns_cap = new_cap; }
+		}
+		if (frames_done < frame_ns_cap)
+			frame_ns[frames_done] = done_ns - submit_ns[in_idx];
 		frames_done++;
-		double frame_ms = (double)frame_ns[frames_done - 1] / 1e6;
-		printf("  frame %u/%u done (in_buf=%u out_buf=%u) %.3f ms (%.1f fps)\n",
-		       frames_done, cfg->num_frames, in_idx, out_idx,
-		       frame_ms, 1000.0 / frame_ms);
+		/* Update params for next frame if requested */
+		if (params_ctx.fd >= 0) {
+			struct params_config new_cfg;
+			struct params_config *refill = NULL;
+			if (cfg->randomize_params) {
+				params_config_default(&new_cfg);
+				params_config_randomize(&new_cfg);
+				refill = &new_cfg;
+			}
+			params_buf = params_cycle(&params_ctx, refill);
+		}
+
+		if (!cfg->duration_ms) {
+			double frame_ms = (double)frame_ns[frames_done - 1] / 1e6;
+			if (params_buf >= 0)
+				printf("  seq=%-5u  buf: in=%u out=%u params=%d   %.3f ms  (%.1f fps)\n",
+				       out_seq, in_idx, out_idx, params_buf,
+				       frame_ms, 1000.0 / frame_ms);
+			else
+				printf("  seq=%-5u  buf: in=%u out=%u   %.3f ms  (%.1f fps)\n",
+				       out_seq, in_idx, out_idx,
+				       frame_ms, 1000.0 / frame_ms);
+		}
 
 		/* Save output frame */
 		if (out_file_fd >= 0 && frames_done == 1) {
@@ -428,15 +499,11 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				       cfg->output_file);
 		}
 
-		if (frames_done >= cfg->num_frames)
+		if (!cfg->duration_ms && frames_done >= cfg->num_frames)
 			break;
 
-		/* Re-fill and re-queue input */
+		/* Re-queue input (pattern was filled once at init) */
 		frame_num++;
-		if (input_fd < 0)
-			fill_bayer_pattern(in_ctx.bufs[in_idx],
-					   in_ctx.width, in_ctx.height,
-					   in_ctx.bytesperline, frame_num);
 		submit_ns[in_idx] = now_ns();
 		if (vnode_qbuf(&in_ctx, in_idx) < 0) {
 			perror("VIDIOC_QBUF input requeue");
@@ -449,8 +516,8 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	}
 
 	ret = 0;
-	print_timing_summary(frame_ns, frames_done);
-	printf("Test complete: %u frames processed\n", frames_done);
+	uint64_t streamoff_ns = now_ns();
+	print_timing_summary(frame_ns, frames_done, streamoff_ns - streamon_ns);
 
 out_streamoff:
 	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -462,11 +529,8 @@ out:
 	if (input_fd >= 0)    close(input_fd);
 	if (out_file_fd >= 0) close(out_file_fd);
 
-	if (params_fd >= 0) {
-		int t = V4L2_BUF_TYPE_META_OUTPUT;
-		ioctl(params_fd, VIDIOC_STREAMOFF, &t);
-		close(params_fd);
-	}
+	params_close(&params_ctx);
+	free(params_cfgs);
 
 	vnode_ctx_close(&in_ctx);
 	vnode_ctx_close(&out_ctx);
