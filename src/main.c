@@ -12,7 +12,7 @@
  *   -o <file>       Output raw YUV frame file (default: discard)
  *   -s <WxH>        Input size  (default: 640x480)
  *   -S <WxH>        Output size (default: same as input)
- *   -f <fourcc>     Input format fourcc (default: RGGB = V4L2_PIX_FMT_SRGGB8)
+ *   -f <fourcc>     Input format fourcc (default: RGGB); also RG10P/BG10P/GB10P/GR10P for 10-bit
  *   -F <fourcc>     Output format fourcc (default: NV12)
  *   -n <count>      Number of frames to process (default: 1)
  *   -T <seconds>    Run for a duration instead of frame count
@@ -63,15 +63,25 @@ static void usage(const char *prog)
 		"  -R              Randomize params before each frame (implies -p)\n"
 		"  -h              Show this help\n"
 		"\n"
-		"Supported input formats:  RGGB BGGR GBRG GRBG (8-bit plain)\n"
+		"Supported input formats:  RGGB BGGR GBRG GRBG (8-bit)\n"
+		"                          RG10P BG10P GB10P GR10P (10-bit packed MIPI)\n"
 		"Supported output formats: NV12 NV21 NV16 NV61 NV24 GREY\n",
 		prog);
 }
 
 static uint32_t parse_fourcc(const char *s)
 {
+	/* Named aliases for common formats */
+	if (!strcmp(s, "RGGB")) return V4L2_PIX_FMT_SRGGB8;
+	if (!strcmp(s, "BGGR")) return V4L2_PIX_FMT_SBGGR8;
+	if (!strcmp(s, "GBRG")) return V4L2_PIX_FMT_SGBRG8;
+	if (!strcmp(s, "GRBG")) return V4L2_PIX_FMT_SGRBG8;
+	if (!strcmp(s, "RG10P") || !strcmp(s, "RG10")) return V4L2_PIX_FMT_SRGGB10P;
+	if (!strcmp(s, "BG10P") || !strcmp(s, "BG10")) return V4L2_PIX_FMT_SBGGR10P;
+	if (!strcmp(s, "GB10P") || !strcmp(s, "GB10")) return V4L2_PIX_FMT_SGBRG10P;
+	if (!strcmp(s, "GR10P") || !strcmp(s, "GR10")) return V4L2_PIX_FMT_SGRBG10P;
 	if (strlen(s) != 4) {
-		fprintf(stderr, "Invalid fourcc '%s' (must be 4 chars)\n", s);
+		fprintf(stderr, "Invalid fourcc '%s'\n", s);
 		return 0;
 	}
 	return v4l2_fourcc(s[0], s[1], s[2], s[3]);

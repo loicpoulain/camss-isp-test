@@ -36,6 +36,7 @@ struct capture_ctx {
 	uint32_t     fourcc;
 	uint32_t     width;
 	uint32_t     height;
+	uint32_t     bytesperline;
 	uint32_t     sizeimage;
 	unsigned int buf_count;
 	int          dmabuf_fds[MAX_PIPELINE_BUFS]; /* exported dmabuf fds */
@@ -94,10 +95,11 @@ static int capture_open(const char *devnode, uint32_t fourcc,
 			fprintf(stderr, "capture: VIDIOC_S_FMT: %s\n", strerror(errno));
 			goto err;
 		}
-		c->fourcc    = fmt.fmt.pix_mp.pixelformat;
-		c->width     = fmt.fmt.pix_mp.width;
-		c->height    = fmt.fmt.pix_mp.height;
-		c->sizeimage = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+		c->fourcc       = fmt.fmt.pix_mp.pixelformat;
+		c->width        = fmt.fmt.pix_mp.width;
+		c->height       = fmt.fmt.pix_mp.height;
+		c->bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+		c->sizeimage    = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 	} else {
 		if (fourcc) fmt.fmt.pix.pixelformat = fourcc;
 		if (width)  fmt.fmt.pix.width       = width;
@@ -108,15 +110,16 @@ static int capture_open(const char *devnode, uint32_t fourcc,
 			fprintf(stderr, "capture: VIDIOC_S_FMT: %s\n", strerror(errno));
 			goto err;
 		}
-		c->fourcc    = fmt.fmt.pix.pixelformat;
-		c->width     = fmt.fmt.pix.width;
-		c->height    = fmt.fmt.pix.height;
-		c->sizeimage = fmt.fmt.pix.sizeimage;
+		c->fourcc       = fmt.fmt.pix.pixelformat;
+		c->width        = fmt.fmt.pix.width;
+		c->height       = fmt.fmt.pix.height;
+		c->bytesperline = fmt.fmt.pix.bytesperline;
+		c->sizeimage    = fmt.fmt.pix.sizeimage;
 	}
 
-	printf("  %-6s  %s  %ux%u %.4s  size=%u\n",
+	printf("  %-6s  %s  %ux%u %.4s  bpl=%u  size=%u\n",
 	       "Capture", devnode, c->width, c->height,
-	       (char *)&c->fourcc, c->sizeimage);
+	       (char *)&c->fourcc, c->bytesperline, c->sizeimage);
 
 	/* Allocate MMAP buffers so we can export them as dmabuf */
 	req.type   = c->type;
@@ -434,16 +437,45 @@ static void print_timing_summary(const uint64_t *frame_ns,
 
 /* Fill input buffer with a simple Bayer gradient pattern */
 static void fill_bayer_pattern(void *buf, uint32_t width, uint32_t height,
-				uint32_t bytesperline, uint32_t frame_num)
+				uint32_t bytesperline, uint32_t frame_num,
+				uint32_t fourcc)
 {
 	uint8_t *p = buf;
 
-	for (uint32_t y = 0; y < height; y++) {
-		for (uint32_t x = 0; x < width; x++) {
-			/* Simple gradient with frame offset for animation */
-			p[y * bytesperline + x] =
-				(uint8_t)((x + y + frame_num * 4) & 0xff);
+	switch (fourcc) {
+	case V4L2_PIX_FMT_SRGGB10P:
+	case V4L2_PIX_FMT_SBGGR10P:
+	case V4L2_PIX_FMT_SGBRG10P:
+	case V4L2_PIX_FMT_SGRBG10P:
+		/* MIPI packed 10-bit: 4 pixels -> 5 bytes */
+		for (uint32_t y = 0; y < height; y++) {
+			uint8_t *row = p + y * bytesperline;
+			for (uint32_t x = 0; x < width; x += 4) {
+				uint16_t v0 = (uint16_t)((x + 0 + y + frame_num * 4) & 0x3ff);
+				uint16_t v1 = (uint16_t)((x + 1 + y + frame_num * 4) & 0x3ff);
+				uint16_t v2 = (uint16_t)((x + 2 + y + frame_num * 4) & 0x3ff);
+				uint16_t v3 = (uint16_t)((x + 3 + y + frame_num * 4) & 0x3ff);
+				row[0] = (uint8_t)(v0 >> 2);
+				row[1] = (uint8_t)(v1 >> 2);
+				row[2] = (uint8_t)(v2 >> 2);
+				row[3] = (uint8_t)(v3 >> 2);
+				row[4] = (uint8_t)(((v0 & 3)) |
+						   ((v1 & 3) << 2) |
+						   ((v2 & 3) << 4) |
+						   ((v3 & 3) << 6));
+				row += 5;
+			}
 		}
+		break;
+	default:
+		/* 8-bit plain */
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				p[y * bytesperline + x] =
+					(uint8_t)((x + y + frame_num * 4) & 0xff);
+			}
+		}
+		break;
 	}
 }
 
@@ -550,6 +582,26 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				 cfg->input_fmt, cfg->width, cfg->height,
 				 depth, &cap_ctx) < 0)
 			goto out;
+
+		/* Re-issue S_FMT on OPE input with capture device bytesperline
+		 * to ensure stride matches (capture driver may align differently) */
+		if (cap_ctx.bytesperline && cap_ctx.bytesperline != in_ctx.bytesperline) {
+			struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
+			fmt.fmt.pix_mp.pixelformat          = in_ctx.fmt;
+			fmt.fmt.pix_mp.width                = in_ctx.width;
+			fmt.fmt.pix_mp.height               = in_ctx.height;
+			fmt.fmt.pix_mp.field                = V4L2_FIELD_NONE;
+			fmt.fmt.pix_mp.plane_fmt[0].bytesperline = cap_ctx.bytesperline;
+			if (ioctl(in_ctx.fd, VIDIOC_S_FMT, &fmt) == 0) {
+				in_ctx.bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+				in_ctx.sizeimage    = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+				printf("  %-6s  %s  %ux%u %.4s  bpl=%u  size=%u  (stride adjusted to match capture)\n",
+				       "Input", in_vn->devnode,
+				       in_ctx.width, in_ctx.height,
+				       (char *)&in_ctx.fmt,
+				       in_ctx.bytesperline, in_ctx.sizeimage);
+			}
+		}
 	}
 	if (depth > MAX_PIPELINE_BUFS) depth = MAX_PIPELINE_BUFS;
 	if (!cfg->duration_ms && depth > cfg->num_frames) depth = cfg->num_frames;
@@ -661,11 +713,13 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				if (n < (ssize_t)in_ctx.sizeimage)
 					fill_bayer_pattern(in_ctx.bufs[i],
 							   in_ctx.width, in_ctx.height,
-							   in_ctx.bytesperline, i);
+							   in_ctx.bytesperline, i,
+							   in_ctx.fmt);
 			} else {
 				fill_bayer_pattern(in_ctx.bufs[i],
 						   in_ctx.width, in_ctx.height,
-						   in_ctx.bytesperline, i);
+						   in_ctx.bytesperline, i,
+						   in_ctx.fmt);
 			}
 			if (vnode_qbuf(&in_ctx, i) < 0) {
 				perror("VIDIOC_QBUF input");
