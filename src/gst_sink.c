@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * camss-isp-test: GStreamer appsrc sink
+ * camss-isp-m2m: GStreamer appsrc sink — async push thread
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,11 +12,18 @@
 
 #include "gst_sink.h"
 
+struct gst_frame {
+	GstBuffer *buf;    /* filled and ready to push */
+	uint64_t   pts_ns; /* kept for duration computation */
+};
+
 struct gst_sink {
 	GstElement  *pipeline;
 	GstAppSrc   *appsrc;
 	unsigned int fps;
 	uint64_t     last_pts_ns;
+	GAsyncQueue *queue;
+	GThread     *thread;
 };
 
 static const char *fourcc_to_gst(uint32_t fourcc)
@@ -30,6 +37,26 @@ static const char *fourcc_to_gst(uint32_t fourcc)
 	case V4L2_PIX_FMT_GREY: return "GRAY8";
 	default:                 return NULL;
 	}
+}
+
+static gpointer push_thread(gpointer user_data)
+{
+	struct gst_sink *sink = user_data;
+
+	while (1) {
+		struct gst_frame *frame = g_async_queue_pop(sink->queue);
+
+		if (!frame->buf) {
+			/* Stop sentinel */
+			free(frame);
+			break;
+		}
+
+		gst_app_src_push_buffer(sink->appsrc, frame->buf);
+		free(frame);
+	}
+
+	return NULL;
 }
 
 struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
@@ -48,7 +75,8 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 	if (!sink)
 		return NULL;
 
-	sink->fps = fps;
+	sink->fps   = fps;
+	sink->queue = g_async_queue_new();
 
 	char caps[256];
 	if (fps)
@@ -64,6 +92,7 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 	if (asprintf(&full_pipeline,
 		     "appsrc name=src caps=\"%s\" format=time is-live=true do-timestamp=true ! %s",
 		     caps, pipeline_str) < 0) {
+		g_async_queue_unref(sink->queue);
 		free(sink);
 		return NULL;
 	}
@@ -78,6 +107,7 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 		fprintf(stderr, "gst_sink: failed to create pipeline: %s\n",
 			err ? err->message : "unknown");
 		if (err) g_error_free(err);
+		g_async_queue_unref(sink->queue);
 		free(sink);
 		return NULL;
 	}
@@ -86,6 +116,7 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 	if (!appsrc_elem) {
 		fprintf(stderr, "gst_sink: could not find appsrc element\n");
 		gst_object_unref(sink->pipeline);
+		g_async_queue_unref(sink->queue);
 		free(sink);
 		return NULL;
 	}
@@ -98,9 +129,12 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 		fprintf(stderr, "gst_sink: failed to start pipeline\n");
 		gst_object_unref(sink->appsrc);
 		gst_object_unref(sink->pipeline);
+		g_async_queue_unref(sink->queue);
 		free(sink);
 		return NULL;
 	}
+
+	sink->thread = g_thread_new("gst-push", push_thread, sink);
 
 	return sink;
 }
@@ -108,32 +142,45 @@ struct gst_sink *gst_sink_open(unsigned int width, unsigned int height,
 int gst_sink_push(struct gst_sink *sink, const void *data, size_t size,
 		  uint64_t pts_ns)
 {
+	/* Compute duration */
+	GstClockTime duration;
+	if (sink->fps > 0)
+		duration = GST_SECOND / sink->fps;
+	else if (sink->last_pts_ns > 0)
+		duration = pts_ns - sink->last_pts_ns;
+	else
+		duration = GST_CLOCK_TIME_NONE;
+	sink->last_pts_ns = pts_ns;
+
+	/* Allocate and fill GstBuffer — copy happens here in the main thread */
 	GstBuffer *buf = gst_buffer_new_allocate(NULL, size, NULL);
 	if (!buf)
 		return -1;
-
 	gst_buffer_fill(buf, 0, data, size);
-
-	GstClockTime duration;
-	if (sink->fps > 0) {
-		duration = GST_SECOND / sink->fps;
-	} else if (sink->last_pts_ns > 0) {
-		duration = pts_ns - sink->last_pts_ns;
-	} else {
-		duration = GST_CLOCK_TIME_NONE;
-	}
-	sink->last_pts_ns = pts_ns;
-
 	GST_BUFFER_DURATION(buf) = duration;
 
-	GstFlowReturn ret = gst_app_src_push_buffer(sink->appsrc, buf);
-	return (ret == GST_FLOW_OK) ? 0 : -1;
+	struct gst_frame *frame = malloc(sizeof(*frame));
+	if (!frame) {
+		gst_buffer_unref(buf);
+		return -1;
+	}
+	frame->buf    = buf;
+	frame->pts_ns = pts_ns;
+
+	g_async_queue_push(sink->queue, frame);
+	return 0;
 }
 
 void gst_sink_close(struct gst_sink *sink)
 {
 	if (!sink)
 		return;
+
+	/* Send stop sentinel */
+	struct gst_frame *stop = calloc(1, sizeof(*stop));
+	g_async_queue_push(sink->queue, stop);
+	g_thread_join(sink->thread);
+	g_async_queue_unref(sink->queue);
 
 	gst_app_src_end_of_stream(sink->appsrc);
 

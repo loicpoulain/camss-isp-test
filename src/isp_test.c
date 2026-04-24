@@ -532,6 +532,9 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				   cfg->output_height ? cfg->output_height : cfg->height) < 0)
 		goto out;
 
+	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
+	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
+
 #ifdef HAVE_GSTREAMER
 	if (cfg->gst_pipeline) {
 		gst = gst_sink_open(out_w, out_h, cfg->output_fmt,
@@ -540,9 +543,6 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			goto out;
 	}
 #endif
-
-	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
-	unsigned int depth = cfg->pipeline_depth ? cfg->pipeline_depth : 1;
 
 	/* Open live capture device if requested */
 	if (cfg->input_device) {
@@ -711,6 +711,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 	uint32_t frames_done = 0;
 	uint32_t frame_num   = 0;
+	int      stall_warned = 0;
 
 	uint64_t deadline_ns = cfg->duration_ms
 		? streamon_ns + (uint64_t)cfg->duration_ms * 1000000ULL
@@ -733,8 +734,13 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			goto out_streamoff;
 		}
 		if (pret == 0) {
-			fprintf(stderr, "Timeout waiting for output frame %u\n",
-				frames_done);
+			if (!stall_warned) {
+				fprintf(stderr,
+					"Warning: OPE output timeout — no output buffer available.\n"
+					"  Try increasing pipeline depth with -d (current: %u).\n",
+					depth);
+				stall_warned = 1;
+			}
 			goto out_streamoff;
 		}
 
@@ -850,8 +856,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (out_ns && frames_done - 1 < frame_ns_cap)
 			out_ns[frames_done - 1] = now_ns() - done_ns;
 
-		/* Re-queue output buffer to OPE immediately — before input requeue
-		 * which may block on capture_dqbuf */
+		/* Re-queue output buffer to OPE immediately */
 		if (vnode_qbuf(&out_ctx, out_idx) < 0) {
 			perror("VIDIOC_QBUF output requeue");
 			goto out_streamoff;
