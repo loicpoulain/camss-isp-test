@@ -27,6 +27,7 @@ void params_config_default(struct params_config *cfg)
 	cfg->wb_b_gain      = PARAMS_WB_B_GAIN_DEFAULT;
 	cfg->wb_r_gain      = PARAMS_WB_R_GAIN_DEFAULT;
 	cfg->include_wb     = 1;
+	cfg->wb_enabled     = 1;
 
 	cfg->ce_luma_v0  = PARAMS_CE_LUMA_V0_DEFAULT;
 	cfg->ce_luma_v1  = PARAMS_CE_LUMA_V1_DEFAULT;
@@ -41,6 +42,7 @@ void params_config_default(struct params_config *cfg)
 	cfg->ce_kcb      = PARAMS_CE_KCB_DEFAULT;
 	cfg->ce_kcr      = PARAMS_CE_KCR_DEFAULT;
 	cfg->include_ce  = 1;
+	cfg->ce_enabled  = 1;
 
 	/* Color correction: identity matrix */
 	int16_t cc_a[] = PARAMS_CC_A_DEFAULT;
@@ -53,6 +55,7 @@ void params_config_default(struct params_config *cfg)
 	memcpy(cfg->cc_k, cc_k, sizeof(cfg->cc_k));
 	cfg->cc_m       = PARAMS_CC_M_DEFAULT;
 	cfg->include_cc = 1;
+	cfg->cc_enabled = 1;
 }
 
 void params_config_randomize(struct params_config *cfg)
@@ -102,7 +105,9 @@ ssize_t params_build(void *buf, size_t bufsize,
 			(struct camss_params_wb_gain *)(data + data_size);
 		wb->header.type  = CAMSS_PARAMS_WB_GAIN;
 		wb->header.size  = sizeof(*wb);
-		wb->header.flags = 0;
+		wb->header.flags = cfg->wb_enabled
+			? V4L2_ISP_PARAMS_FL_BLOCK_ENABLE
+			: V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
 		wb->g_gain       = cfg->wb_g_gain;
 		wb->b_gain       = cfg->wb_b_gain;
 		wb->r_gain       = cfg->wb_r_gain;
@@ -115,7 +120,9 @@ ssize_t params_build(void *buf, size_t bufsize,
 			(struct camss_params_chroma_enhan *)(data + data_size);
 		cc->header.type  = CAMSS_PARAMS_CHROMA_ENHAN;
 		cc->header.size  = sizeof(*cc);
-		cc->header.flags = 0;
+		cc->header.flags = cfg->ce_enabled
+			? V4L2_ISP_PARAMS_FL_BLOCK_ENABLE
+			: V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
 		cc->luma_v0  = cfg->ce_luma_v0;
 		cc->luma_v1  = cfg->ce_luma_v1;
 		cc->luma_v2  = cfg->ce_luma_v2;
@@ -137,7 +144,9 @@ ssize_t params_build(void *buf, size_t bufsize,
 			(struct camss_params_color_correct *)(data + data_size);
 		cc->header.type  = CAMSS_PARAMS_COLOR_CORRECT;
 		cc->header.size  = sizeof(*cc);
-		cc->header.flags = 0;
+		cc->header.flags = cfg->cc_enabled
+			? V4L2_ISP_PARAMS_FL_BLOCK_ENABLE
+			: V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
 		memcpy(cc->a, cfg->cc_a, sizeof(cc->a));
 		memcpy(cc->b, cfg->cc_b, sizeof(cc->b));
 		memcpy(cc->c, cfg->cc_c, sizeof(cc->c));

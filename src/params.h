@@ -46,6 +46,7 @@ struct params_config {
 
 	/* Which blocks to include (all enabled by default) */
 	int include_wb;
+	int wb_enabled;   /* 0 = send block with DISABLE flag */
 
 	/* Color correction matrix (BT.601 defaults) */
 	int16_t ce_luma_v0;
@@ -61,6 +62,7 @@ struct params_config {
 	int16_t ce_kcb;
 	int16_t ce_kcr;
 	int include_ce;
+	int ce_enabled;   /* 0 = send block with DISABLE flag */
 
 	/* Color correction matrix */
 	int16_t cc_a[3];
@@ -69,6 +71,7 @@ struct params_config {
 	int16_t cc_k[3];
 	int16_t cc_m;
 	int include_cc;
+	int cc_enabled;   /* 0 = send block with DISABLE flag */
 };
 
 /**

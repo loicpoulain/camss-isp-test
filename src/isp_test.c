@@ -24,6 +24,7 @@ extern volatile sig_atomic_t g_interrupted;
 #endif
 #include "media.h"
 #include "params.h"
+#include "params_ctrl.h"
 
 #define MAX_PIPELINE_BUFS 3
 
@@ -509,6 +510,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	struct isp_vnode *in_vn, *out_vn, *params_vn;
 	struct params_ctx params_ctx = { .fd = -1 };
 	struct params_config *params_cfgs = NULL;
+	struct params_ctrl params_ctrl = {};
 	int ret = -1;
 	int out_file_fd = -1;
 #ifdef HAVE_GSTREAMER
@@ -606,22 +608,19 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	if (depth > MAX_PIPELINE_BUFS) depth = MAX_PIPELINE_BUFS;
 	if (!cfg->duration_ms && depth > cfg->num_frames) depth = cfg->num_frames;
 
-	/* Open params vnode last so it joins the shared context */
-	if (cfg->with_params) {
-		if (!params_vn || !params_vn->devnode[0]) {
-			fprintf(stderr, "Warning: params vnode not found, continuing without\n");
-		} else {
-		params_cfgs = calloc(depth, sizeof(*params_cfgs));
+	/* Prepare params config (opened after Buffers: header below) */
+	unsigned int params_count = 0;
+	if (cfg->with_params && params_vn && params_vn->devnode[0]) {
+		params_count = cfg->randomize_params ? depth : 1;
+		params_cfgs = calloc(params_count, sizeof(*params_cfgs));
 		if (!params_cfgs) goto out;
-		for (unsigned int i = 0; i < depth; i++) {
+		for (unsigned int i = 0; i < params_count; i++) {
 			params_config_default(&params_cfgs[i]);
 			if (cfg->randomize_params)
 				params_config_randomize(&params_cfgs[i]);
 		}
-		if (params_open(params_vn->devnode, depth, params_cfgs,
-				&params_ctx) < 0)
-			fprintf(stderr, "Warning: params open failed, continuing without\n");
-		}
+	} else if (cfg->with_params) {
+		fprintf(stderr, "Warning: params vnode not found, continuing without\n");
 	}
 
 	if (!cfg->input_device)
@@ -647,6 +646,15 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	int out_nbufs = vnode_alloc_bufs(&out_ctx, depth);
 	if (out_nbufs < 0)
 		goto out;
+
+	/* Open params vnode here so its buffers appear in the Buffers: section */
+	if (params_count > 0) {
+		if (params_open(params_vn->devnode, params_count, params_cfgs,
+				&params_ctx) < 0)
+			fprintf(stderr, "Warning: params open failed, continuing without\n");
+		else
+			params_ctrl_start(&params_ctrl, &params_cfgs[0]);
+	}
 
 	uint32_t frame_ns_cap = cfg->duration_ms ? 4096 : cfg->num_frames;
 	frame_ns = calloc(frame_ns_cap, sizeof(*frame_ns));
@@ -866,16 +874,21 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			frame_ns[frames_done] = done_ns - submit_ns[in_idx];
 		frames_done++;
 
-		/* Update params */
+		/* Update params:
+		 * -R: cycle every frame with a new random config (stress test)
+		 * -p: only update when interactive control sends a new config */
 		if (params_ctx.fd >= 0) {
-			struct params_config new_cfg;
-			struct params_config *refill = NULL;
 			if (cfg->randomize_params) {
+				struct params_config new_cfg;
 				params_config_default(&new_cfg);
 				params_config_randomize(&new_cfg);
-				refill = &new_cfg;
+				params_buf = params_cycle(&params_ctx, &new_cfg);
+			} else {
+				struct params_config new_cfg;
+				if (params_ctrl_get(&params_ctrl, &new_cfg))
+					params_buf = params_cycle(&params_ctx, &new_cfg);
+				/* else: buffer stays queued, no DQBUF/QBUF overhead */
 			}
-			params_buf = params_cycle(&params_ctx, refill);
 		}
 
 		if (!cfg->duration_ms) {
@@ -978,6 +991,7 @@ out:
 #ifdef HAVE_GSTREAMER
 	gst_sink_close(gst);
 #endif
+	params_ctrl_stop(&params_ctrl);
 	params_close(&params_ctx);
 	free(params_cfgs);
 
