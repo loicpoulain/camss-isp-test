@@ -570,23 +570,6 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	if (cfg->framerate && vnode_set_framerate(&in_ctx, cfg->framerate) < 0)
 		goto out;
 
-	/* Apply input crop if requested */
-	if (cfg->crop_width && cfg->crop_height) {
-		struct v4l2_selection sel = {
-			.type   = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-			.target = V4L2_SEL_TGT_CROP,
-			.r = { .left   = cfg->crop_left,
-			       .top    = cfg->crop_top,
-			       .width  = cfg->crop_width,
-			       .height = cfg->crop_height },
-		};
-		if (ioctl(in_ctx.fd, VIDIOC_S_SELECTION, &sel) < 0) {
-			fprintf(stderr, "VIDIOC_S_SELECTION (crop): %s\n", strerror(errno));
-			goto out;
-		}
-		printf("  Input crop:   %ux%u+%d+%d\n",
-		       sel.r.width, sel.r.height, sel.r.left, sel.r.top);
-	}
 
 	/* Open and configure output */
 	if (vnode_open_and_set_fmt(&out_ctx, out_vn->devnode,
@@ -597,57 +580,176 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				   cfg->output_bpl) < 0)
 		goto out;
 
-	/* Configure ope_proc source: sets scaler output (compose) size.
-	 * Configure ope_disp source: sets compose placement in output buffer.
+	/*
+	 * Configure subdev pad formats explicitly.
+	 * Per the MC-centric driver model, userspace is responsible for
+	 * setting all subdev pad formats independently; the driver no longer
+	 * propagates formats from video nodes to subdev pads.
+	 *
+	 * Pipeline:
+	 *   ope_input -> [ope_proc pad0(sink_in)] -> [ope_proc pad2(source)]
+	 *             -> [ope_disp pad0(sink)] -> [ope_disp pad1(source)]
+	 *             -> ope_disp_output
 	 */
 	{
-		const char *proc_dev = media_find_subdev(pipe, "ope_proc");
+		/* Map output fourcc to mbus code */
+		uint32_t out_mbus;
+		switch (cfg->output_fmt) {
+		case V4L2_PIX_FMT_NV24:
+		case V4L2_PIX_FMT_NV42:
+			out_mbus = 0x2025; /* MEDIA_BUS_FMT_YUV8_1X24 */
+			break;
+		case V4L2_PIX_FMT_NV16:
+		case V4L2_PIX_FMT_NV61:
+			out_mbus = 0x2008; /* MEDIA_BUS_FMT_YUYV8_2X8 */
+			break;
+		case V4L2_PIX_FMT_GREY:
+			out_mbus = 0x2001; /* MEDIA_BUS_FMT_Y8_1X8 */
+			break;
+		case V4L2_PIX_FMT_NV12:
+		case V4L2_PIX_FMT_NV21:
+		default:
+			out_mbus = 0x2004; /* MEDIA_BUS_FMT_YUYV8_1_5X8 */
+			break;
+		}
 
+		/* Map input fourcc to mbus code */
+		uint32_t in_mbus;
+		switch (cfg->input_fmt) {
+		case V4L2_PIX_FMT_SBGGR10P: in_mbus = 0x3007; break; /* MEDIA_BUS_FMT_SBGGR10_1X10 */
+		case V4L2_PIX_FMT_SGBRG10P: in_mbus = 0x300e; break; /* MEDIA_BUS_FMT_SGBRG10_1X10 */
+		case V4L2_PIX_FMT_SGRBG10P: in_mbus = 0x300a; break; /* MEDIA_BUS_FMT_SGRBG10_1X10 */
+		case V4L2_PIX_FMT_SRGGB10P: in_mbus = 0x300f; break; /* MEDIA_BUS_FMT_SRGGB10_1X10 */
+		case V4L2_PIX_FMT_SBGGR8:   in_mbus = 0x3001; break; /* MEDIA_BUS_FMT_SBGGR8_1X8 */
+		case V4L2_PIX_FMT_SGBRG8:   in_mbus = 0x3013; break; /* MEDIA_BUS_FMT_SGBRG8_1X8 */
+		case V4L2_PIX_FMT_SGRBG8:   in_mbus = 0x3002; break; /* MEDIA_BUS_FMT_SGRBG8_1X8 */
+		case V4L2_PIX_FMT_SRGGB8:
+		default:                     in_mbus = 0x3014; break; /* MEDIA_BUS_FMT_SRGGB8_1X8 */
+		}
+
+		uint32_t out_w = cfg->output_width  ? cfg->output_width  : cfg->width;
+		uint32_t out_h = cfg->output_height ? cfg->output_height : cfg->height;
+		uint32_t compose_w = cfg->compose_width  ? cfg->compose_width  : out_w;
+		uint32_t compose_h = cfg->compose_height ? cfg->compose_height : out_h;
+
+		/* --- ope_proc subdev --- */
+		const char *proc_dev = media_find_subdev(pipe, "ope_proc");
 		if (proc_dev) {
 			int proc_fd = open(proc_dev, O_RDWR | O_CLOEXEC);
 			if (proc_fd < 0) {
-				perror("open proc subdev");
+				perror("open ope_proc subdev");
 				goto out;
 			}
-			/* Source pad (pad 2): set scaler output size */
+
+			/* Pad 0 (SINK_IN): input Bayer format */
 			struct v4l2_subdev_format sfmt = {
 				.which = V4L2_SUBDEV_FORMAT_ACTIVE,
-				.pad   = 2, /* OPE_PROC_PAD_SOURCE */
+				.pad   = 0,
 				.format = {
-					.width  = cfg->compose_width  ? cfg->compose_width
-						: cfg->output_width   ? cfg->output_width  : cfg->width,
-					.height = cfg->compose_height ? cfg->compose_height
-						: cfg->output_height  ? cfg->output_height : cfg->height,
-					.code   = 0x2004, /* MEDIA_BUS_FMT_YUYV8_1X16 */
+					.width  = cfg->width,
+					.height = cfg->height,
+					.code   = in_mbus,
 					.field  = V4L2_FIELD_NONE,
 				},
 			};
 			if (ioctl(proc_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0)
-				perror("VIDIOC_SUBDEV_S_FMT (proc source)");
+				perror("VIDIOC_SUBDEV_S_FMT (proc sink_in)");
 			else
-				printf("  Proc output:  %ux%u\n",
-				       sfmt.format.width, sfmt.format.height);
-			/* Set compose rect: scale size + placement in output buffer */
-			if (cfg->compose_width && cfg->compose_height) {
+				printf("  proc sink_in: %ux%u mbus=0x%04x\n",
+				       sfmt.format.width, sfmt.format.height, sfmt.format.code);
+
+			/* Pad 0 crop: always set explicitly (no implicit propagation) */
+			{
 				struct v4l2_subdev_selection ssel = {
 					.which  = V4L2_SUBDEV_FORMAT_ACTIVE,
-					.pad    = 2, /* OPE_PROC_PAD_SOURCE */
-					.target = V4L2_SEL_TGT_COMPOSE,
-					.r = { .left   = cfg->compose_left,
-					       .top    = cfg->compose_top,
-					       .width  = cfg->compose_width,
-					       .height = cfg->compose_height },
+					.pad    = 0,
+					.target = V4L2_SEL_TGT_CROP,
+					.r = {
+						.left   = cfg->crop_width ? cfg->crop_left   : 0,
+						.top    = cfg->crop_width ? cfg->crop_top    : 0,
+						.width  = cfg->crop_width ? cfg->crop_width  : cfg->width,
+						.height = cfg->crop_width ? cfg->crop_height : cfg->height,
+					},
 				};
 				if (ioctl(proc_fd, VIDIOC_SUBDEV_S_SELECTION, &ssel) < 0)
-					perror("VIDIOC_SUBDEV_S_SELECTION (compose)");
+					perror("VIDIOC_SUBDEV_S_SELECTION (proc crop)");
 				else
-					printf("  Proc compose: %ux%u+%d+%d\n",
+					printf("  proc crop:    %ux%u+%d+%d\n",
 					       ssel.r.width, ssel.r.height,
 					       ssel.r.left, ssel.r.top);
 			}
+
+			/*
+			 * Pad 2 compose: always set explicitly — the cascade from
+			 * sink_in resets it to the crop size, so we must re-apply
+			 * the desired output size before setting the source fmt.
+			 */
+			{
+				struct v4l2_subdev_selection ssel = {
+					.which  = V4L2_SUBDEV_FORMAT_ACTIVE,
+					.pad    = 2,
+					.target = V4L2_SEL_TGT_COMPOSE,
+					.r = { .left   = cfg->compose_left,
+					       .top    = cfg->compose_top,
+					       .width  = compose_w,
+					       .height = compose_h },
+				};
+				if (ioctl(proc_fd, VIDIOC_SUBDEV_S_SELECTION, &ssel) < 0)
+					perror("VIDIOC_SUBDEV_S_SELECTION (proc compose)");
+				else
+					printf("  proc compose: %ux%u+%d+%d\n",
+					       ssel.r.width, ssel.r.height,
+					       ssel.r.left, ssel.r.top);
+			}
+
+			/* Pad 2 (SOURCE): set mbus code — size is driven by compose */
+			sfmt.pad = 2;
+			sfmt.format.width  = compose_w;
+			sfmt.format.height = compose_h;
+			sfmt.format.code   = out_mbus;
+			if (ioctl(proc_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0)
+				perror("VIDIOC_SUBDEV_S_FMT (proc source)");
+			else
+				printf("  proc source:  %ux%u mbus=0x%04x\n",
+				       sfmt.format.width, sfmt.format.height, sfmt.format.code);
+
 			close(proc_fd);
 		}
 
+		/* --- ope_disp subdev --- */
+		const char *disp_dev = media_find_subdev(pipe, "ope_disp");
+		if (disp_dev) {
+			int disp_fd = open(disp_dev, O_RDWR | O_CLOEXEC);
+			if (disp_fd < 0) {
+				perror("open ope_disp subdev");
+				goto out;
+			}
+
+			struct v4l2_subdev_format sfmt = {
+				.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+				.format = {
+					.width  = compose_w,
+					.height = compose_h,
+					.code   = out_mbus,
+					.field  = V4L2_FIELD_NONE,
+				},
+			};
+
+			/* Pad 0 (SINK) */
+			sfmt.pad = 0;
+			if (ioctl(disp_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0)
+				perror("VIDIOC_SUBDEV_S_FMT (disp sink)");
+
+			/* Pad 1 (SOURCE) */
+			sfmt.pad = 1;
+			if (ioctl(disp_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0)
+				perror("VIDIOC_SUBDEV_S_FMT (disp source)");
+			else
+				printf("  disp:         %ux%u mbus=0x%04x\n",
+				       sfmt.format.width, sfmt.format.height, sfmt.format.code);
+
+			close(disp_fd);
+		}
 	}
 
 	/* Allocate buffers: depth clamped to [1, MAX_PIPELINE_BUFS] */
@@ -776,6 +878,22 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		}
 	}
 
+	/* Stream on before queuing buffers — output first, then input.
+	 * With min_queued_buffers=1 the driver defers start_streaming
+	 * until the first QBUF, so STREAMON must come first to ensure
+	 * both queues are in streaming state before any buffer is queued. */
+	int type;
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	if (ioctl(out_ctx.fd, VIDIOC_STREAMON, &type) < 0) {
+		perror("VIDIOC_STREAMON output");
+		goto out;
+	}
+	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	if (ioctl(in_ctx.fd, VIDIOC_STREAMON, &type) < 0) {
+		perror("VIDIOC_STREAMON input");
+		goto out;
+	}
+
 	/* Pre-queue input buffers.
 	 * Capture path: submit one capture frame to OPE before STREAMON;
 	 * remaining capture buffers stay queued to the capture device and
@@ -829,18 +947,6 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		}
 	}
 
-	/* Stream on — output first, then input */
-	int type;
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	if (ioctl(out_ctx.fd, VIDIOC_STREAMON, &type) < 0) {
-		perror("VIDIOC_STREAMON output");
-		goto out;
-	}
-	type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-	if (ioctl(in_ctx.fd, VIDIOC_STREAMON, &type) < 0) {
-		perror("VIDIOC_STREAMON input");
-		goto out;
-	}
 	uint64_t streamon_ns = now_ns();
 	/* For capture path, submit_ns[0] set in pre-queue; others set in hot loop.
 	 * For non-capture path, all buffers submitted at STREAMON. */
