@@ -241,6 +241,10 @@ static void vnode_ctx_close(struct vnode_ctx *v)
 		if (v->bufs[i] && v->bufs[i] != MAP_FAILED)
 			munmap(v->bufs[i], v->buf_lengths[i]);
 	}
+	/* Release kernel buffers before closing so vb2 marks the queue idle */
+	struct v4l2_requestbuffers req = { .type = v->type, .count = 0,
+					   .memory = V4L2_MEMORY_MMAP };
+	ioctl(v->fd, VIDIOC_REQBUFS, &req);
 	close(v->fd);
 	v->fd = -1;
 }
@@ -629,8 +633,10 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 		uint32_t out_w = cfg->output_width  ? cfg->output_width  : cfg->width;
 		uint32_t out_h = cfg->output_height ? cfg->output_height : cfg->height;
-		uint32_t compose_w = cfg->compose_width  ? cfg->compose_width  : out_w;
-		uint32_t compose_h = cfg->compose_height ? cfg->compose_height : out_h;
+		uint32_t compose_w = cfg->compose_width  ? cfg->compose_width
+				   : cfg->crop_width   ? cfg->crop_width  : out_w;
+		uint32_t compose_h = cfg->compose_height ? cfg->compose_height
+				   : cfg->crop_height  ? cfg->crop_height : out_h;
 
 		/* --- ope_proc subdev --- */
 		const char *proc_dev = media_find_subdev(pipe, "ope_proc");
@@ -712,6 +718,11 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			else
 				printf("  proc source:  %ux%u mbus=0x%04x\n",
 				       sfmt.format.width, sfmt.format.height, sfmt.format.code);
+
+			/* Use the kernel-returned size for ope_disp (may differ from
+			 * compose_w/h if the kernel clamped it to the crop bounds) */
+			compose_w = sfmt.format.width;
+			compose_h = sfmt.format.height;
 
 			close(proc_fd);
 		}

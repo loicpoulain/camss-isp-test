@@ -22,8 +22,14 @@ static void print_help(void)
 		"  chroma_enhan=enable|disable\n"
 		"  color_correct=enable|disable\n"
 		"  wb_gain.g_gain=N          WB green gain (Q5.10, 1024=1.0)\n"
-		"  wb_gain.b_gain=N          WB blue gain\n"
-		"  wb_gain.r_gain=N          WB red gain\n"
+		"  wb_gain.b_gain=N          WB blue gain (Q5.10, 1024=1.0)\n"
+		"  wb_gain.r_gain=N          WB red gain (Q5.10, 1024=1.0)\n"
+		"  wb_gain.g_sub=N           WB green sub-offset (u16, 65535=full scale)\n"
+		"  wb_gain.b_sub=N           WB blue  sub-offset (u16, 65535=full scale)\n"
+		"  wb_gain.r_sub=N           WB red   sub-offset (u16, 65535=full scale)\n"
+		"  wb_gain.g_add=N           WB green add-offset (u16, 65535=full scale)\n"
+		"  wb_gain.b_add=N           WB blue  add-offset (u16, 65535=full scale)\n"
+		"  wb_gain.r_add=N           WB red   add-offset (u16, 65535=full scale)\n"
 		"  chroma_enhan.luma_v0=N    R->Y coefficient (12sQ8)\n"
 		"  chroma_enhan.luma_v1=N    G->Y coefficient\n"
 		"  chroma_enhan.luma_v2=N    B->Y coefficient\n"
@@ -130,6 +136,12 @@ static int parse_command(const char *line, struct params_config *cfg)
 		if      (strcmp(field, "g_gain") == 0) cfg->wb_g_gain = (uint16_t)value;
 		else if (strcmp(field, "b_gain") == 0) cfg->wb_b_gain = (uint16_t)value;
 		else if (strcmp(field, "r_gain") == 0) cfg->wb_r_gain = (uint16_t)value;
+		else if (strcmp(field, "g_sub")  == 0) cfg->wb_g_sub  = (int16_t)value;
+		else if (strcmp(field, "b_sub")  == 0) cfg->wb_b_sub  = (int16_t)value;
+		else if (strcmp(field, "r_sub")  == 0) cfg->wb_r_sub  = (int16_t)value;
+		else if (strcmp(field, "g_add")  == 0) cfg->wb_g_add  = (int16_t)value;
+		else if (strcmp(field, "b_add")  == 0) cfg->wb_b_add  = (int16_t)value;
+		else if (strcmp(field, "r_add")  == 0) cfg->wb_r_add  = (int16_t)value;
 		else goto unknown_field;
 		fprintf(stderr, "params: wb_gain.%s = %ld\n", field, value);
 		return 1;
@@ -156,9 +168,9 @@ static int parse_command(const char *line, struct params_config *cfg)
 
 	/* ---- color_correct ---- */
 	if (strcmp(block, "color_correct") == 0) {
-		if (strcmp(field, "m") == 0) {
-			cfg->cc_m = (int16_t)value;
-			fprintf(stderr, "params: color_correct.m = %ld\n", value);
+		if (strcmp(field, "qfactor") == 0) {
+			cfg->cc_qfactor = (int16_t)value;
+			fprintf(stderr, "params: color_correct.qfactor = %ld\n", value);
 			return 1;
 		}
 		if (idx < 0 || idx > 2) {

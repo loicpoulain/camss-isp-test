@@ -14,11 +14,17 @@
 #include <linux/types.h>
 #include <linux/media/v4l2-isp.h>
 
+/* Userspace compat: __aligned is a kernel macro, map to GCC attribute */
+#ifndef __aligned
+#define __aligned(x) __attribute__((aligned(x)))
+#endif
+
 /* V4L2_META_FMT_QCOM_ISP_PARAMS is defined in videodev2.h;
  * provide it here for builds against older system headers. */
 #ifndef V4L2_META_FMT_QCOM_ISP_PARAMS
 #define V4L2_META_FMT_QCOM_ISP_PARAMS	v4l2_fourcc('Q', 'C', 'I', 'P')
 #endif
+
 
 /**
  * enum camss_params_block_type - CAMSS ISP parameter block identifiers
@@ -36,42 +42,78 @@ enum camss_params_block_type {
 /**
  * struct camss_params_wb_gain - White Balance gains
  *
- * @header:   generic block header; @header.type = CAMSS_PARAMS_WB_GAIN
- * @g_gain:   green channel gain (Q5.10)
- * @b_gain:   blue channel gain (Q5.10)
- * @r_gain:   red channel gain (Q5.10)
+ * Implements the CLC_WB pipeline module.  The pipeline applies three
+ * sequential operations per channel:
+ *   1. Subtract sub-offset (black-level substraction)
+ *   2. Multiply by gain    (colour balance)
+ *   3. Add add-offset      (output pedestal)
+ * 
+ * Gains are 15uQ10 (15-bit unsigned, 10 fractional bits).
+ * Offsets are signed and clamped to 12, 13 or 15 bits
+ * depending on hardware variant.
+ *
+ * @header:   block header; @header.type = CAMSS_PARAMS_WB_GAIN
+ * @g_gain:   green channel gain (15uQ10, 1024 = 1.0)
+ * @b_gain:   blue  channel gain (15uQ10, 1024 = 1.0)
+ * @r_gain:   red   channel gain (15uQ10, 1024 = 1.0)
+ * @g_sub:    green sub-offset, subtracted before gain
+ * @b_sub:    blue  sub-offset, subtracted before gain
+ * @r_sub:    red   sub-offset, subtracted before gain
+ * @g_add:    green add-offset, added after gain
+ * @b_add:    blue  add-offset, added after gain
+ * @r_add:    red   add-offset, added after gain
  */
 struct camss_params_wb_gain {
 	struct v4l2_isp_params_block_header header;
 	__u16 g_gain;
 	__u16 b_gain;
 	__u16 r_gain;
-	__u16 _pad;
-} __attribute__((aligned(8)));
+	__s16 g_sub;
+	__s16 b_sub;
+	__s16 r_sub;
+	__s16 g_add;
+	__s16 b_add;
+	__s16 r_add;
+	__u16 _pad[3];
+} __aligned(8);
 
 /**
- * struct camss_params_chroma_enhan - RGB to YUV colour correction matrix
+ * struct camss_params_chroma_enhan - RGB to YUV colour transfer matrix
  *
  * Implements the CLC_CHROMA_ENHAN pipeline module. All coefficients are
  * signed 12-bit fixed-point Q3.8 (range roughly -8.0 to +7.996).
  *
- * Luma (Y) row of the matrix:
- * @luma_v0:  R-to-Y coefficient (12sQ8, e.g. 0x04d = 0.299 BT.601)
- * @luma_v1:  G-to-Y coefficient (12sQ8, e.g. 0x096 = 0.587 BT.601)
- * @luma_v2:  B-to-Y coefficient (12sQ8, e.g. 0x01d = 0.114 BT.601)
- * @luma_k:   Y output offset    (9sQ0,  0 = no offset)
+ * RGB2Y - Luma (Y) ceofficients
+ * Y = v0 * R + v1 * G + v2 * B
  *
- * Chroma (Cb) row:
- * @coeff_ap: Cb positive coefficient (12sQ8, e.g. 0x0e6 =  0.886 BT.601)
- * @coeff_am: Cb negative coefficient (12sQ8, e.g. 0xfb3 = -0.338 BT.601)
- * @kcb:      Cb output offset        (11s,   128 = +128)
+ * @luma_v0:  R-to-Y coefficient (12sQ8)
+ * @luma_v1:  G-to-Y coefficient (12sQ8)
+ * @luma_v2:  B-to-Y coefficient (12sQ8)
+ * @luma_k:   Y output offset    (9s,  0 = no offset)
  *
- * Chroma (Cr) row:
- * @coeff_cp: Cr positive coefficient (12sQ8, e.g. 0x0b3 =  0.701 BT.601)
- * @coeff_cm: Cr negative coefficient (12sQ8, e.g. 0xfe3 = -0.114 BT.601)
+ * RGB2Cb - Chroma (Cb) coefficients
+ * Cb = a x ((B - G) + b(R - G)) + KCb
+ * with:
+ *   a = ap, when (B-G) + b(R-G) > 0; a = am, when (B-G) + b(R-G) ≤ 0;
+ *   b = bp when (R-G) > 0; b = bm when (R-G) ≤ 0
+ *
+ * @coeff_ap: Cb positive coefficient (12sQ8)
+ * @coeff_am: Cb negative coefficient (12sQ8)
+ * @coeff_bp: Cb positive coefficient (12sQ8)
+ * @coeff_bm: Cb negative coefficient (12sQ8)
+ * @kcb:      Cb output offset        (11s)
+ *
+ * RGB2Cr - Chroma (Cr) coefficients:
+ * Cr = c x ((R - G) + d(B - G)) + KCr
+ * with:
+ *   c = cp, when (R-G) + d(B-G) > 0; c = cm, when (R-G) + d(B-G) ≤ 0
+ *   d = dp when (B-G) > 0; d = dm when (B-G) ≤ 0
+ *
+ * @coeff_cp: Cr positive coefficient (12sQ8)
+ * @coeff_cm: Cr negative coefficient (12sQ8)
  * @coeff_dp: Cr positive coefficient (12sQ8)
  * @coeff_dm: Cr negative coefficient (12sQ8)
- * @kcr:      Cr output offset        (11s,   128 = +128)
+ * @kcr:      Cr output offset        (11s)
  *
  * @header: generic block header; @header.type = CAMSS_PARAMS_CHROMA_ENHAN
  */
@@ -83,26 +125,36 @@ struct camss_params_chroma_enhan {
 	__u16 luma_k;
 	__u16 coeff_ap;
 	__u16 coeff_am;
+	__u16 coeff_bp;
+	__u16 coeff_bm;
 	__u16 coeff_cp;
 	__u16 coeff_cm;
 	__u16 coeff_dp;
 	__u16 coeff_dm;
 	__u16 kcb;
 	__u16 kcr;
-} __attribute__((aligned(8)));
+	__u16 _pad[2];
+} __aligned(8);
 
-/*
+/**
+ * struct camss_params_color_correct - colour correction matrix
  *
- * signed 12-bit fixed-point (Qm)
+ * Implements the CLC_CC pipeline module.  The matrix computes:
+ *   Out_ch0 (G) = a0*G + b0*B + c0*R + k0
+ *   Out_ch1 (B) = a1*G + b1*B + c1*R + k1
+ *   Out_ch2 (R) = a2*G + b2*B + c2*R + k2
  *
- * Out_ch0 (g) = A0*G+B0*B+C0*R + K0; 
- * Out_ch1 (b) = A1*G+B1*B+C1*R + K1; 
- * Out_ch2 (r) = A2*G+B2*B+C2*R + K2,
- * 
- * m = 0x0 - Coefficients are signed 12sQ7 numbers
- * m = 0x1 - Coefficients are signed 12sQ8 numbers
- * m = 0x2 - Coefficients are signed 12sQ9 numbers
- * m = 0x3 - Coefficients are signed 12sQ10 numbers
+ * @header:  block header; @header.type = CAMSS_PARAMS_COLOR_CORRECT
+ * @a:       G-input coefficients per output channel (12s;
+ *           a[0]=Out_G, a[1]=Out_B, a[2]=Out_R)
+ * @b:       B-input coefficients (12s)
+ * @c:       R-input coefficients (12s)
+ * @k:       per-output-channel offsets (typically 9s effective)
+ * @qfactor: Q-format selector (2u):
+ *           0 = 12sQ7  (range ~-256.0 .. +255.992)
+ *           1 = 12sQ8  (range ~-128.0 .. +127.996)
+ *           2 = 12sQ9  (range ~-64.0  .. +63.998)
+ *           3 = 12sQ10 (range ~-32.0  .. +31.999)
  */
 struct camss_params_color_correct {
 	struct v4l2_isp_params_block_header header;
@@ -110,8 +162,9 @@ struct camss_params_color_correct {
 	__u16 b[3];
 	__u16 c[3];
 	__u16 k[3];
-	__u16 m;
-} __attribute__((aligned(8)));
+	__u16 qfactor;
+	__u16 _pad[3];
+} __aligned(8);
 
 #define CAMSS_PARAMS_MAX_PAYLOAD		\
 	(sizeof(struct camss_params_wb_gain)	+\

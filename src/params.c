@@ -26,6 +26,12 @@ void params_config_default(struct params_config *cfg)
 	cfg->wb_g_gain      = PARAMS_WB_G_GAIN_DEFAULT;
 	cfg->wb_b_gain      = PARAMS_WB_B_GAIN_DEFAULT;
 	cfg->wb_r_gain      = PARAMS_WB_R_GAIN_DEFAULT;
+	cfg->wb_g_sub       = PARAMS_WB_G_SUB_DEFAULT;
+	cfg->wb_b_sub       = PARAMS_WB_B_SUB_DEFAULT;
+	cfg->wb_r_sub       = PARAMS_WB_R_SUB_DEFAULT;
+	cfg->wb_g_add       = PARAMS_WB_G_ADD_DEFAULT;
+	cfg->wb_b_add       = PARAMS_WB_B_ADD_DEFAULT;
+	cfg->wb_r_add       = PARAMS_WB_R_ADD_DEFAULT;
 	cfg->include_wb     = 1;
 	cfg->wb_enabled     = 1;
 
@@ -53,7 +59,7 @@ void params_config_default(struct params_config *cfg)
 	memcpy(cfg->cc_b, cc_b, sizeof(cfg->cc_b));
 	memcpy(cfg->cc_c, cc_c, sizeof(cfg->cc_c));
 	memcpy(cfg->cc_k, cc_k, sizeof(cfg->cc_k));
-	cfg->cc_m       = PARAMS_CC_M_DEFAULT;
+	cfg->cc_qfactor = PARAMS_CC_QFACTOR_DEFAULT;
 	cfg->include_cc = 1;
 	cfg->cc_enabled = 1;
 }
@@ -111,6 +117,12 @@ ssize_t params_build(void *buf, size_t bufsize,
 		wb->g_gain       = cfg->wb_g_gain;
 		wb->b_gain       = cfg->wb_b_gain;
 		wb->r_gain       = cfg->wb_r_gain;
+		wb->g_sub        = cfg->wb_g_sub;
+		wb->b_sub        = cfg->wb_b_sub;
+		wb->r_sub        = cfg->wb_r_sub;
+		wb->g_add        = cfg->wb_g_add;
+		wb->b_add        = cfg->wb_b_add;
+		wb->r_add        = cfg->wb_r_add;
 		data_size += sizeof(*wb);
 	}
 
@@ -151,7 +163,7 @@ ssize_t params_build(void *buf, size_t bufsize,
 		memcpy(cc->b, cfg->cc_b, sizeof(cc->b));
 		memcpy(cc->c, cfg->cc_c, sizeof(cc->c));
 		memcpy(cc->k, cfg->cc_k, sizeof(cc->k));
-		cc->m = cfg->cc_m;
+		cc->qfactor = cfg->cc_qfactor;
 		data_size += sizeof(*cc);
 	}
 

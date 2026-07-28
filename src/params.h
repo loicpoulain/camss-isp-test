@@ -12,6 +12,12 @@
 #define PARAMS_WB_G_GAIN_DEFAULT  ((1 << 10) / 1)   /* 1.0  Q5.10 */
 #define PARAMS_WB_B_GAIN_DEFAULT  ((3 << 10) / 2)   /* 1.5  Q5.10 */
 #define PARAMS_WB_R_GAIN_DEFAULT  ((3 << 10) / 2)   /* 1.5  Q5.10 */
+#define PARAMS_WB_G_SUB_DEFAULT   0
+#define PARAMS_WB_B_SUB_DEFAULT   0
+#define PARAMS_WB_R_SUB_DEFAULT   0
+#define PARAMS_WB_G_ADD_DEFAULT   0
+#define PARAMS_WB_B_ADD_DEFAULT   0
+#define PARAMS_WB_R_ADD_DEFAULT   0
 #define PARAMS_CE_LUMA_V0_DEFAULT  0x04d  /* R->Y  0.299 BT.601 12sQ8 */
 #define PARAMS_CE_LUMA_V1_DEFAULT  0x096  /* G->Y  0.587 BT.601 12sQ8 */
 #define PARAMS_CE_LUMA_V2_DEFAULT  0x01d  /* B->Y  0.114 BT.601 12sQ8 */
@@ -30,7 +36,7 @@
 #define PARAMS_CC_B_DEFAULT  { 0x000, 0x100, 0x000 }
 #define PARAMS_CC_C_DEFAULT  { 0x000, 0x000, 0x100 }
 #define PARAMS_CC_K_DEFAULT  { 0, 0, 0 }
-#define PARAMS_CC_M_DEFAULT  0
+#define PARAMS_CC_QFACTOR_DEFAULT  0
 
 
 /**
@@ -42,7 +48,12 @@ struct params_config {
 	uint16_t wb_b_gain;
 	uint16_t wb_r_gain;
 
-	/* Black level subtraction */
+	int16_t  wb_g_sub;
+	int16_t  wb_b_sub;
+	int16_t  wb_r_sub;
+	int16_t  wb_g_add;
+	int16_t  wb_b_add;
+	int16_t  wb_r_add;
 
 	/* Which blocks to include (all enabled by default) */
 	int include_wb;
@@ -69,7 +80,7 @@ struct params_config {
 	int16_t cc_b[3];
 	int16_t cc_c[3];
 	int16_t cc_k[3];
-	int16_t cc_m;
+	int16_t cc_qfactor;
 	int include_cc;
 	int cc_enabled;   /* 0 = send block with DISABLE flag */
 };
