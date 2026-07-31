@@ -58,7 +58,7 @@ Supported output formats: NV12 NV21 NV16 NV61 NV24 GREY
 
 | Option | Description |
 |--------|-------------|
-| *(none)* | Generated Bayer gradient pattern |
+| *(none)* | Generated Bayer colour-bar pattern |
 | `-i <file>` | Raw Bayer frame loaded from file, reused every frame |
 | `-I <device>` | Live V4L2 capture device; frames fed to OPE via dmabuf zero-copy |
 
@@ -105,6 +105,9 @@ wb_gain.r_gain=1500        # WB red gain
 chroma_enhan.luma_v0=0x4d  # R->Y coefficient (12sQ8)
 color_correct.a[0]=256     # CC matrix A[0]
 color_correct.m=1          # CC Q mode (0-3)
+gamma=enable               # Enable gamma (CLC_GLUT) block
+gamma.pattern=curve        # identity|zero|max|invert|random|curve
+gamma.value=220            # gamma x100 for 'curve' (220 = 2.2)
 reset                      # Reload defaults
 help                       # Show all available commands
 ```

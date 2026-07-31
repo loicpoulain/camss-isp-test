@@ -443,7 +443,75 @@ static void print_timing_summary(const uint64_t *frame_ns,
 	print_latency_row("Out latency", out_ns, count);
 }
 
-/* Fill input buffer with a simple Bayer gradient pattern */
+/*
+ * Return which colour (0=R, 1=G, 2=B) the CFA site at (x, y) samples, for the
+ * given Bayer fourcc.  The fourcc names the top-left 2x2 order, e.g. RGGB =
+ * R G / G B.
+ */
+static int bayer_site_color(uint32_t fourcc, uint32_t x, uint32_t y)
+{
+	/* 2x2 CFA as [row0col0, row0col1, row1col0, row1col1], 0=R 1=G 2=B */
+	static const struct { uint32_t fourcc; int cfa[4]; } maps[] = {
+		{ V4L2_PIX_FMT_SRGGB8,   { 0, 1, 1, 2 } },
+		{ V4L2_PIX_FMT_SBGGR8,   { 2, 1, 1, 0 } },
+		{ V4L2_PIX_FMT_SGBRG8,   { 1, 2, 0, 1 } },
+		{ V4L2_PIX_FMT_SGRBG8,   { 1, 0, 2, 1 } },
+		{ V4L2_PIX_FMT_SRGGB10P, { 0, 1, 1, 2 } },
+		{ V4L2_PIX_FMT_SBGGR10P, { 2, 1, 1, 0 } },
+		{ V4L2_PIX_FMT_SGBRG10P, { 1, 2, 0, 1 } },
+		{ V4L2_PIX_FMT_SGRBG10P, { 1, 0, 2, 1 } },
+	};
+	const int *cfa = maps[0].cfa; /* default RGGB */
+
+	for (size_t i = 0; i < sizeof(maps) / sizeof(maps[0]); i++) {
+		if (maps[i].fourcc == fourcc) {
+			cfa = maps[i].cfa;
+			break;
+		}
+	}
+	return cfa[(y & 1) * 2 + (x & 1)];
+}
+
+/*
+ * Compute the 8-bit (R,G,B) test colour at pixel (x, y).
+ *
+ * Top ~2/3 of the frame: eight vertical colour bars in the classic order
+ *   white, yellow, cyan, green, magenta, red, blue, black.
+ * Bottom ~1/3: a horizontal grayscale ramp (0 -> 255 across the width) so a
+ * gamma curve is visible as a smooth luminance sweep, not just discrete bars.
+ */
+static void pattern_rgb(uint32_t x, uint32_t y, uint32_t width,
+			uint32_t height, uint8_t rgb[3])
+{
+	static const uint8_t bars[8][3] = {
+		{ 255, 255, 255 }, /* white   */
+		{ 255, 255,   0 }, /* yellow  */
+		{   0, 255, 255 }, /* cyan    */
+		{   0, 255,   0 }, /* green   */
+		{ 255,   0, 255 }, /* magenta */
+		{ 255,   0,   0 }, /* red     */
+		{   0,   0, 255 }, /* blue    */
+		{   0,   0,   0 }, /* black   */
+	};
+	uint32_t ramp_top = height - height / 3; /* start row of the ramp band */
+
+	if (height && y >= ramp_top) {
+		/* Grayscale ramp across the width */
+		uint8_t g = width > 1 ? (uint8_t)((x * 255) / (width - 1)) : 0;
+
+		rgb[0] = rgb[1] = rgb[2] = g;
+	} else {
+		uint32_t bar = width ? (x * 8) / width : 0;
+
+		if (bar > 7)
+			bar = 7;
+		rgb[0] = bars[bar][0];
+		rgb[1] = bars[bar][1];
+		rgb[2] = bars[bar][2];
+	}
+}
+
+/* Fill input buffer with a Bayer colour-bar pattern */
 static void fill_bayer_pattern(void *buf, uint32_t width, uint32_t height,
 				uint32_t bytesperline, uint32_t frame_num,
 				uint32_t fourcc)
@@ -459,10 +527,16 @@ static void fill_bayer_pattern(void *buf, uint32_t width, uint32_t height,
 		for (uint32_t y = 0; y < height; y++) {
 			uint8_t *row = p + y * bytesperline;
 			for (uint32_t x = 0; x < width; x += 4) {
-				uint16_t v0 = (uint16_t)((x + 0 + y + frame_num * 4) & 0x3ff);
-				uint16_t v1 = (uint16_t)((x + 1 + y + frame_num * 4) & 0x3ff);
-				uint16_t v2 = (uint16_t)((x + 2 + y + frame_num * 4) & 0x3ff);
-				uint16_t v3 = (uint16_t)((x + 3 + y + frame_num * 4) & 0x3ff);
+				uint16_t v[4];
+
+				for (int k = 0; k < 4; k++) {
+					uint8_t rgb[3];
+
+					pattern_rgb(x + k, y, width, height, rgb);
+					/* 8-bit colour scaled to 10-bit CFA sample */
+					v[k] = (uint16_t)(rgb[bayer_site_color(fourcc, x + k, y)] << 2);
+				}
+				uint16_t v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];
 				row[0] = (uint8_t)(v0 >> 2);
 				row[1] = (uint8_t)(v1 >> 2);
 				row[2] = (uint8_t)(v2 >> 2);
@@ -479,12 +553,16 @@ static void fill_bayer_pattern(void *buf, uint32_t width, uint32_t height,
 		/* 8-bit plain */
 		for (uint32_t y = 0; y < height; y++) {
 			for (uint32_t x = 0; x < width; x++) {
+				uint8_t rgb[3];
+
+				pattern_rgb(x, y, width, height, rgb);
 				p[y * bytesperline + x] =
-					(uint8_t)((x + y + frame_num * 4) & 0xff);
+					rgb[bayer_site_color(fourcc, x, y)];
 			}
 		}
 		break;
 	}
+	(void)frame_num;
 }
 
 static int vnode_set_framerate(struct vnode_ctx *v, unsigned int fps)

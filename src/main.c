@@ -8,7 +8,7 @@
  * Options:
  *   -e              Enumerate formats on all pipeline vnodes and exit
  *   -t              Print media topology and exit
- *   -i <file>       Input raw Bayer frame file (default: generated pattern)
+ *   -i <file>       Input raw Bayer frame file (default: generated colour-bar pattern)
  *   -o <file>       Output raw YUV frame file (default: discard)
  *   -s <WxH>        Input size  (default: 640x480)
  *   -S <WxH>        Output size (default: same as input)
