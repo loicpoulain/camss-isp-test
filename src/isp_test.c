@@ -894,6 +894,10 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 			params_config_default(&params_cfgs[i]);
 			if (cfg->randomize_params)
 				params_config_randomize(&params_cfgs[i]);
+			if (cfg->gamma_pattern >= 0) {
+				params_cfgs[i].gamma_pattern = cfg->gamma_pattern;
+				params_cfgs[i].gamma_enabled = 1;
+			}
 		}
 	} else if (cfg->with_params) {
 		fprintf(stderr, "Warning: params vnode not found, continuing without\n");
@@ -1189,8 +1193,9 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				      out_ctx.sizeimage, done_ns);
 #endif
 
-		/* Save output frame */
-		if (out_file_fd >= 0 && frames_done == 1) {
+		/* Save output frame (rewind so the file holds the LAST frame) */
+		if (out_file_fd >= 0) {
+			lseek(out_file_fd, 0, SEEK_SET);
 			ssize_t n = write(out_file_fd, out_ctx.bufs[out_idx],
 					  out_ctx.sizeimage);
 			if (n < (ssize_t)out_ctx.sizeimage)

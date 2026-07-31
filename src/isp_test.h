@@ -57,6 +57,12 @@ struct frame_config {
 	unsigned int pipeline_depth;
 	unsigned int framerate;
 	int          randomize_params;
+	/*
+	 * Startup gamma test: pattern index (enum params_gamma_pattern) or -1
+	 * to leave the gamma block disabled.  Lets a non-interactive run
+	 * (e.g. writing to a file with -o) exercise the gamma path.
+	 */
+	int          gamma_pattern;
 	uint32_t     duration_ms;
 	const char  *input_device;
 	const char  *gst_pipeline;

@@ -64,6 +64,8 @@ static void usage(const char *prog)
 		"  -b <bpl>        Input bytesperline (0 = driver default)\n"
 		"  -B <bpl>        Output bytesperline (0 = driver default)\n"
 		"  -p              Enqueue params buffer with default ISP tuning\n"
+		"  -P <pattern>    Enable gamma block with pattern "
+		"(identity|zero|max|invert|random|curve); implies -p\n"
 		"                  Type block.field=value while streaming to update\n"
 		"                  (e.g. wb_gain.g_gain=1200), reset, or help\n"
 		"  -R              Randomize params every frame (implies -p)\n"
@@ -115,6 +117,7 @@ int main(int argc, char *argv[])
 		.pipeline_depth = 1,
 		.framerate = 0,
 		.randomize_params = 0,
+		.gamma_pattern = -1,
 	};
 	int do_enum     = 0;
 	int do_topology = 0;
@@ -194,12 +197,17 @@ int main(int argc, char *argv[])
 		case 'R': cfg.randomize_params = 1; cfg.with_params = 1;   break;
 		case 'p': cfg.with_params = 1; break;
 		case 'P':
-			/* Custom WB green gain implies -p */
+			/* -P <pattern>: enable gamma block with a startup pattern.
+			 * Useful for non-interactive file capture (-o). */
 			cfg.with_params = 1;
-			/* Store in output_file slot temporarily — handled below */
-			/* Actually just set with_params; full params API via params.h */
-			(void)atoi(optarg); /* TODO: expose full params_config via CLI */
-			cfg.with_params = 1;
+			cfg.gamma_pattern = params_gamma_pattern_from_name(optarg);
+			if (cfg.gamma_pattern < 0) {
+				fprintf(stderr,
+					"Invalid gamma pattern '%s' "
+					"(identity|zero|max|invert|random|curve)\n",
+					optarg);
+				return 1;
+			}
 			break;
 		case 'h':
 			usage(argv[0]);
