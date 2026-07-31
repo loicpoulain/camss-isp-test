@@ -36,8 +36,12 @@ enum camss_params_block_type {
 	CAMSS_PARAMS_WB_GAIN = 1,
 	CAMSS_PARAMS_CHROMA_ENHAN = 2,
 	CAMSS_PARAMS_COLOR_CORRECT = 3,
+	CAMSS_PARAMS_GAMMA = 4,
 	CAMSS_PARAMS_MAX,
 };
+
+/* Number of entries in each gamma channel LUT. */
+#define CAMSS_OPE_GAMMA_LUT_SIZE	256
 
 /**
  * struct camss_params_wb_gain - White Balance gains
@@ -166,9 +170,39 @@ struct camss_params_color_correct {
 	__u16 _pad[3];
 } __aligned(8);
 
+/**
+ * struct camss_params_gamma - per-channel gamma correction curves
+ *
+ * Implements the CLC_GLUT pipeline module, applied in the RGB domain.  It
+ * holds one independent lookup table per colour channel; each table is a
+ * direct (not segmented) map of input level to output level.
+ *
+ * Each table has CAMSS_OPE_GAMMA_LUT_SIZE (256) entries of 16-bit unsigned
+ * output.  The hardware indexes a table with the most-significant 8 bits of
+ * the channel sample and linearly interpolates between adjacent entries, so
+ * entry i is the output for input level i/255 of full scale.  Output is
+ * normalised to full scale: 0x0000 = black, 0xFFFF = white.
+ *
+ * Fill a curve, e.g.:
+ *   Identity (gamma 1.0):     lut[i] = 257 * i;
+ *   Encode gamma g (g=2.2):   lut[i] = round(pow(i / 255.0, 1.0 / g) * 65535);
+ *
+ * @header:  block header; @header.type = CAMSS_PARAMS_GAMMA
+ * @glut:    green channel gamma curve (CAMSS_OPE_GAMMA_LUT_SIZE entries)
+ * @blut:    blue  channel gamma curve
+ * @rlut:    red   channel gamma curve
+ */
+struct camss_params_gamma {
+	struct v4l2_isp_params_block_header header;
+	__u16 glut[CAMSS_OPE_GAMMA_LUT_SIZE];
+	__u16 blut[CAMSS_OPE_GAMMA_LUT_SIZE];
+	__u16 rlut[CAMSS_OPE_GAMMA_LUT_SIZE];
+} __aligned(8);
+
 #define CAMSS_PARAMS_MAX_PAYLOAD		\
 	(sizeof(struct camss_params_wb_gain)	+\
 	 sizeof(struct camss_params_chroma_enhan)	+\
-	 sizeof(struct camss_params_color_correct))
+	 sizeof(struct camss_params_color_correct)	+\
+	 sizeof(struct camss_params_gamma))
 
 #endif /* _UAPI_LINUX_CAMSS_CONFIG_H */

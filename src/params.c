@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -62,6 +63,12 @@ void params_config_default(struct params_config *cfg)
 	cfg->cc_qfactor = PARAMS_CC_QFACTOR_DEFAULT;
 	cfg->include_cc = 1;
 	cfg->cc_enabled = 1;
+
+	/* Gamma: identity curve, disabled (bypassed) like the driver default */
+	cfg->gamma_pattern = PARAMS_GAMMA_PATTERN_DEFAULT;
+	cfg->gamma_value   = PARAMS_GAMMA_VALUE_DEFAULT;
+	cfg->include_gamma = 1;
+	cfg->gamma_enabled = 0;
 }
 
 void params_config_randomize(struct params_config *cfg)
@@ -87,6 +94,84 @@ size_t params_buffer_size(void)
 {
 	return offsetof(struct v4l2_isp_params_buffer, data) +
 	       CAMSS_PARAMS_MAX_PAYLOAD;
+}
+
+static const char *const gamma_pattern_names[PARAMS_GAMMA_PATTERN_COUNT] = {
+	[PARAMS_GAMMA_IDENTITY]  = "identity",
+	[PARAMS_GAMMA_ZERO]      = "zero",
+	[PARAMS_GAMMA_MAX]       = "max",
+	[PARAMS_GAMMA_INVERT]    = "invert",
+	[PARAMS_GAMMA_RANDOM]    = "random",
+	[PARAMS_GAMMA_CURVE]     = "curve",
+};
+
+const char *params_gamma_pattern_name(int pattern)
+{
+	if (pattern < 0 || pattern >= PARAMS_GAMMA_PATTERN_COUNT)
+		return "?";
+	return gamma_pattern_names[pattern];
+}
+
+int params_gamma_pattern_from_name(const char *name)
+{
+	for (int i = 0; i < PARAMS_GAMMA_PATTERN_COUNT; i++)
+		if (strcmp(name, gamma_pattern_names[i]) == 0)
+			return i;
+	return -1;
+}
+
+/*
+ * Fill a 256-entry, 16-bit gamma LUT for the given test pattern.  lut[i] is
+ * the output for input level i/255 of full scale.  Patterns mirror the
+ * hardware AUTO_LOAD patterns (zero/max/random) plus an inverting ramp, a
+ * real gamma curve, and the identity pass-through.
+ */
+static void gamma_fill_lut(uint16_t lut[CAMSS_OPE_GAMMA_LUT_SIZE],
+			   int pattern, int value_x100)
+{
+	int i;
+
+	switch (pattern) {
+	case PARAMS_GAMMA_ZERO:
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+			lut[i] = 0x0000;
+		break;
+	case PARAMS_GAMMA_MAX:
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+			lut[i] = 0xFFFF;
+		break;
+	case PARAMS_GAMMA_INVERT:
+		/* photo-negative: output decreases as input increases */
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+			lut[i] = (uint16_t)(0xFFFF - 257 * i);
+		break;
+	case PARAMS_GAMMA_RANDOM:
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+			lut[i] = (uint16_t)(rand() & 0xFFFF);
+		break;
+	case PARAMS_GAMMA_CURVE: {
+		double g = value_x100 / 100.0;
+
+		if (g <= 0.0)
+			g = 1.0;
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++) {
+			double in = i / (double)(CAMSS_OPE_GAMMA_LUT_SIZE - 1);
+			long v = lround(pow(in, 1.0 / g) * 65535.0);
+
+			if (v < 0)
+				v = 0;
+			else if (v > 65535)
+				v = 65535;
+			lut[i] = (uint16_t)v;
+		}
+		break;
+	}
+	case PARAMS_GAMMA_IDENTITY:
+	default:
+		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
+			lut[i] = (uint16_t)(257 * i);
+		break;
+	}
 }
 
 ssize_t params_build(void *buf, size_t bufsize,
@@ -165,6 +250,21 @@ ssize_t params_build(void *buf, size_t bufsize,
 		memcpy(cc->k, cfg->cc_k, sizeof(cc->k));
 		cc->qfactor = cfg->cc_qfactor;
 		data_size += sizeof(*cc);
+	}
+
+	/* GAMMA block */
+	if (cfg->include_gamma) {
+		struct camss_params_gamma *g =
+			(struct camss_params_gamma *)(data + data_size);
+		g->header.type  = CAMSS_PARAMS_GAMMA;
+		g->header.size  = sizeof(*g);
+		g->header.flags = cfg->gamma_enabled
+			? V4L2_ISP_PARAMS_FL_BLOCK_ENABLE
+			: V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
+		gamma_fill_lut(g->glut, cfg->gamma_pattern, cfg->gamma_value);
+		gamma_fill_lut(g->blut, cfg->gamma_pattern, cfg->gamma_value);
+		gamma_fill_lut(g->rlut, cfg->gamma_pattern, cfg->gamma_value);
+		data_size += sizeof(*g);
 	}
 
 	pbuf->data_size = data_size;

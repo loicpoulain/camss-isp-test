@@ -47,6 +47,9 @@ static void print_help(void)
 		"  color_correct.c[0..2]=N   CC matrix row C\n"
 		"  color_correct.k[0..2]=N   CC matrix offsets\n"
 		"  color_correct.m=N         CC Q mode (0-3)\n"
+		"  gamma=enable|disable      Enable/disable gamma (CLC_GLUT) block\n"
+		"  gamma.pattern=NAME        identity|zero|max|invert|random|curve\n"
+		"  gamma.value=N             gamma exponent x100 for 'curve' (e.g. 220=2.2)\n"
 		"  reset                     Reload default values\n"
 		"  help                      Show this help\n");
 }
@@ -104,11 +107,44 @@ static int parse_command(const char *line, struct params_config *cfg)
 					cfg->cc_enabled = en;
 					fprintf(stderr, "params: color_correct %s\n", en ? "enabled" : "disabled");
 					return 1;
+				} else if (strcmp(bname, "gamma") == 0) {
+					cfg->gamma_enabled = en;
+					fprintf(stderr, "params: gamma %s\n", en ? "enabled" : "disabled");
+					return 1;
 				} else {
 					fprintf(stderr, "params: unknown block '%s'\n", bname);
 					return 0;
 				}
 			}
+		}
+	}
+
+	/* gamma.pattern=NAME (string value): handle before the numeric parser */
+	{
+		char pname[64];
+
+		if (sscanf(buf, "gamma.pattern=%63s", pname) == 1) {
+			/* strip trailing whitespace */
+			char *pe = pname + strlen(pname) - 1;
+			while (pe >= pname && isspace((unsigned char)*pe))
+				*pe-- = 0;
+
+			int pat = params_gamma_pattern_from_name(pname);
+			if (pat < 0) {
+				/* allow numeric pattern too */
+				char *endp;
+				long n = strtol(pname, &endp, 0);
+				if (*endp == 0 && n >= 0 && n < PARAMS_GAMMA_PATTERN_COUNT)
+					pat = (int)n;
+			}
+			if (pat < 0) {
+				fprintf(stderr, "params: unknown gamma pattern '%s'\n", pname);
+				return 0;
+			}
+			cfg->gamma_pattern = pat;
+			fprintf(stderr, "params: gamma.pattern = %s\n",
+				params_gamma_pattern_name(pat));
+			return 1;
 		}
 	}
 
@@ -184,6 +220,27 @@ static int parse_command(const char *line, struct params_config *cfg)
 		else goto unknown_field;
 		fprintf(stderr, "params: color_correct.%s[%d] = %ld\n", field, idx, value);
 		return 1;
+	}
+
+	/* ---- gamma ---- */
+	if (strcmp(block, "gamma") == 0) {
+		if (strcmp(field, "value") == 0) {
+			cfg->gamma_value = (int)value;
+			fprintf(stderr, "params: gamma.value = %ld (%.2f)\n",
+				value, value / 100.0);
+			return 1;
+		} else if (strcmp(field, "pattern") == 0) {
+			/* numeric pattern index */
+			if (value < 0 || value >= PARAMS_GAMMA_PATTERN_COUNT) {
+				fprintf(stderr, "params: gamma.pattern out of range\n");
+				return 0;
+			}
+			cfg->gamma_pattern = (int)value;
+			fprintf(stderr, "params: gamma.pattern = %s\n",
+				params_gamma_pattern_name((int)value));
+			return 1;
+		}
+		goto unknown_field;
 	}
 
 	fprintf(stderr, "params: unknown block '%s'\n", block);

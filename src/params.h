@@ -38,6 +38,30 @@
 #define PARAMS_CC_K_DEFAULT  { 0, 0, 0 }
 #define PARAMS_CC_QFACTOR_DEFAULT  0
 
+/*
+ * Gamma (CLC_GLUT) test patterns.  These mirror the hardware AUTO_LOAD
+ * patterns plus a real gamma curve, so the LUT path can be validated
+ * visually (a black frame, a white frame, a linear ramp, noise) as well as
+ * exercised with a plausible gamma encode.
+ */
+enum params_gamma_pattern {
+	PARAMS_GAMMA_IDENTITY = 0, /* lut[i] = 257*i (pass-through)          */
+	PARAMS_GAMMA_ZERO,         /* all entries 0x0000 (output black)      */
+	PARAMS_GAMMA_MAX,          /* all entries 0xFFFF (output white)      */
+	PARAMS_GAMMA_INVERT,       /* reverse ramp: lut[i] = 0xFFFF - 257*i  */
+	PARAMS_GAMMA_RANDOM,       /* random entries                         */
+	PARAMS_GAMMA_CURVE,        /* gamma encode using gamma_value (x100)  */
+	PARAMS_GAMMA_PATTERN_COUNT
+};
+
+/* Default gamma: identity curve, block disabled (matches driver default). */
+#define PARAMS_GAMMA_PATTERN_DEFAULT  PARAMS_GAMMA_IDENTITY
+#define PARAMS_GAMMA_VALUE_DEFAULT    220   /* 2.20, used by GAMMA_CURVE */
+
+/* Parse a pattern name to enum, or -1 if unknown. */
+int params_gamma_pattern_from_name(const char *name);
+const char *params_gamma_pattern_name(int pattern);
+
 
 /**
  * struct params_config - tuning values for one params buffer
@@ -83,6 +107,12 @@ struct params_config {
 	int16_t cc_qfactor;
 	int include_cc;
 	int cc_enabled;   /* 0 = send block with DISABLE flag */
+
+	/* Gamma (CLC_GLUT) */
+	int gamma_pattern; /* enum params_gamma_pattern */
+	int gamma_value;   /* gamma exponent x100 (used by GAMMA_CURVE) */
+	int include_gamma;
+	int gamma_enabled; /* 0 = send block with DISABLE flag */
 };
 
 /**

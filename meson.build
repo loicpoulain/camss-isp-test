@@ -4,6 +4,9 @@ project('camss-isp-m2m', 'c',
 
 inc = include_directories('include')
 
+cc = meson.get_compiler('c')
+m_dep = cc.find_library('m', required : false)
+
 gst_deps = []
 gst_cargs = []
 gst_sources = []
@@ -29,5 +32,5 @@ executable('camss-isp-m2m',
   ] + gst_sources,
   include_directories : inc,
   c_args : ['-D_GNU_SOURCE'] + gst_cargs,
-  dependencies : gst_deps + [dependency('threads')],
+  dependencies : gst_deps + [dependency('threads'), m_dep],
   install : true)
