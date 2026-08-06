@@ -42,6 +42,8 @@ void params_config_default(struct params_config *cfg)
 	cfg->ce_luma_k   = PARAMS_CE_LUMA_K_DEFAULT;
 	cfg->ce_coeff_ap = PARAMS_CE_COEFF_AP_DEFAULT;
 	cfg->ce_coeff_am = PARAMS_CE_COEFF_AM_DEFAULT;
+	cfg->ce_coeff_bp = PARAMS_CE_COEFF_BP_DEFAULT;
+	cfg->ce_coeff_bm = PARAMS_CE_COEFF_BM_DEFAULT;
 	cfg->ce_coeff_cp = PARAMS_CE_COEFF_CP_DEFAULT;
 	cfg->ce_coeff_cm = PARAMS_CE_COEFF_CM_DEFAULT;
 	cfg->ce_coeff_dp = PARAMS_CE_COEFF_DP_DEFAULT;
@@ -62,11 +64,12 @@ void params_config_default(struct params_config *cfg)
 	memcpy(cfg->cc_k, cc_k, sizeof(cfg->cc_k));
 	cfg->cc_qfactor = PARAMS_CC_QFACTOR_DEFAULT;
 	cfg->include_cc = 1;
-	cfg->cc_enabled = 1;
+	cfg->cc_enabled = 0; /* driver default: color_correct disabled (bypassed) */
 
 	/* Gamma: identity curve, disabled (bypassed) like the driver default */
 	cfg->gamma_pattern = PARAMS_GAMMA_PATTERN_DEFAULT;
 	cfg->gamma_value   = PARAMS_GAMMA_VALUE_DEFAULT;
+	cfg->gamma_chan    = 0x7; /* all channels */
 	cfg->include_gamma = 1;
 	cfg->gamma_enabled = 0;
 }
@@ -88,6 +91,14 @@ void params_config_randomize(struct params_config *cfg)
 		cfg->cc_k[i] = (int16_t)((rand() % 33) - 16);
 	}
 
+}
+
+void params_config_include_all(struct params_config *cfg)
+{
+	cfg->include_wb    = 1;
+	cfg->include_ce    = 1;
+	cfg->include_cc    = 1;
+	cfg->include_gamma = 1;
 }
 
 size_t params_buffer_size(void)
@@ -121,10 +132,9 @@ int params_gamma_pattern_from_name(const char *name)
 }
 
 /*
- * Fill a 256-entry, 16-bit gamma LUT for the given test pattern.  lut[i] is
- * the output for input level i/255 of full scale.  Patterns mirror the
- * hardware AUTO_LOAD patterns (zero/max/random) plus an inverting ramp, a
- * real gamma curve, and the identity pass-through.
+ * Fill a 256-entry gamma LUT for the given test pattern.
+ * Each entry is an 8-bit output value (0..255) in the low byte of the
+ * 16-bit DMI word.  lut[i] is the output for input level i (0..255).
  */
 static void gamma_fill_lut(uint16_t lut[CAMSS_OPE_GAMMA_LUT_SIZE],
 			   int pattern, int value_x100)
@@ -134,20 +144,20 @@ static void gamma_fill_lut(uint16_t lut[CAMSS_OPE_GAMMA_LUT_SIZE],
 	switch (pattern) {
 	case PARAMS_GAMMA_ZERO:
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
-			lut[i] = 0x0000;
+			lut[i] = 0;
 		break;
 	case PARAMS_GAMMA_MAX:
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
-			lut[i] = 0xFFFF;
+			lut[i] = 255;
 		break;
 	case PARAMS_GAMMA_INVERT:
 		/* photo-negative: output decreases as input increases */
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
-			lut[i] = (uint16_t)(0xFFFF - 257 * i);
+			lut[i] = (uint16_t)(255 - i);
 		break;
 	case PARAMS_GAMMA_RANDOM:
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
-			lut[i] = (uint16_t)(rand() & 0xFFFF);
+			lut[i] = (uint16_t)(rand() & 0xFF);
 		break;
 	case PARAMS_GAMMA_CURVE: {
 		double g = value_x100 / 100.0;
@@ -156,12 +166,12 @@ static void gamma_fill_lut(uint16_t lut[CAMSS_OPE_GAMMA_LUT_SIZE],
 			g = 1.0;
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++) {
 			double in = i / (double)(CAMSS_OPE_GAMMA_LUT_SIZE - 1);
-			long v = lround(pow(in, 1.0 / g) * 65535.0);
+			long v = lround(pow(in, 1.0 / g) * 255.0);
 
 			if (v < 0)
 				v = 0;
-			else if (v > 65535)
-				v = 65535;
+			else if (v > 255)
+				v = 255;
 			lut[i] = (uint16_t)v;
 		}
 		break;
@@ -169,10 +179,11 @@ static void gamma_fill_lut(uint16_t lut[CAMSS_OPE_GAMMA_LUT_SIZE],
 	case PARAMS_GAMMA_IDENTITY:
 	default:
 		for (i = 0; i < CAMSS_OPE_GAMMA_LUT_SIZE; i++)
-			lut[i] = (uint16_t)(257 * i);
+			lut[i] = (uint16_t)i;
 		break;
 	}
 }
+
 
 ssize_t params_build(void *buf, size_t bufsize,
 		     const struct params_config *cfg)
@@ -226,6 +237,8 @@ ssize_t params_build(void *buf, size_t bufsize,
 		cc->luma_k   = cfg->ce_luma_k;
 		cc->coeff_ap = cfg->ce_coeff_ap;
 		cc->coeff_am = cfg->ce_coeff_am;
+		cc->coeff_bp = cfg->ce_coeff_bp;
+		cc->coeff_bm = cfg->ce_coeff_bm;
 		cc->coeff_cp = cfg->ce_coeff_cp;
 		cc->coeff_cm = cfg->ce_coeff_cm;
 		cc->coeff_dp = cfg->ce_coeff_dp;
@@ -261,9 +274,12 @@ ssize_t params_build(void *buf, size_t bufsize,
 		g->header.flags = cfg->gamma_enabled
 			? V4L2_ISP_PARAMS_FL_BLOCK_ENABLE
 			: V4L2_ISP_PARAMS_FL_BLOCK_DISABLE;
-		gamma_fill_lut(g->glut, cfg->gamma_pattern, cfg->gamma_value);
-		gamma_fill_lut(g->blut, cfg->gamma_pattern, cfg->gamma_value);
-		gamma_fill_lut(g->rlut, cfg->gamma_pattern, cfg->gamma_value);
+		int pg = (cfg->gamma_chan & 0x2) ? cfg->gamma_pattern : PARAMS_GAMMA_IDENTITY;
+		int pb = (cfg->gamma_chan & 0x4) ? cfg->gamma_pattern : PARAMS_GAMMA_IDENTITY;
+		int pr = (cfg->gamma_chan & 0x1) ? cfg->gamma_pattern : PARAMS_GAMMA_IDENTITY;
+		gamma_fill_lut(g->glut, pg, cfg->gamma_value);
+		gamma_fill_lut(g->blut, pb, cfg->gamma_value);
+		gamma_fill_lut(g->rlut, pr, cfg->gamma_value);
 		data_size += sizeof(*g);
 	}
 

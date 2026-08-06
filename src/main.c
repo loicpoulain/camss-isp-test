@@ -23,6 +23,7 @@
  *   -r <fps>        Frame rate in fps, sets VIDIOC_S_PARM (default: driver default)
   -R              Randomize params before each frame (implies -p)
  *   -R              Randomize params buffer before each frame (implies -p)
+ *   -A              Re-queue a full params buffer before each frame (implies -p)
  */
 #include <getopt.h>
 #include <signal.h>
@@ -70,6 +71,11 @@ static void usage(const char *prog)
 		"                  (e.g. wb_gain.g_gain=1200), reset, or help\n"
 		"  -R              Randomize params every frame (implies -p)\n"
 		"                  Allocates depth param buffers for stress testing\n"
+		"  -A              Re-queue a full params buffer every frame (implies -p)\n"
+		"                  All blocks (wb_gain, chroma_enhan, color_correct,\n"
+		"                  gamma) are sent every frame, buffers prepared ahead\n"
+		"                  of time (one per pipeline slot).  Enable/disable\n"
+		"                  state per block is preserved.\n"
 		"  -h              Show this help\n"
 		"\n"
 		"Supported input formats:  RGGB BGGR GBRG GRBG (8-bit)\n"
@@ -118,12 +124,13 @@ int main(int argc, char *argv[])
 		.framerate = 0,
 		.randomize_params = 0,
 		.gamma_pattern = -1,
+		.gamma_chan = 0x7,
 	};
 	int do_enum     = 0;
 	int do_topology = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "eti:I:o:g:s:S:c:C:f:F:n:T:d:r:b:B:pP:Rh")) != -1) {
+	while ((opt = getopt(argc, argv, "eti:I:o:g:s:S:c:C:f:F:n:T:d:r:b:B:pP:RAh")) != -1) {
 		switch (opt) {
 		case 'e': do_enum     = 1; break;
 		case 't': do_topology = 1; break;
@@ -195,20 +202,30 @@ int main(int argc, char *argv[])
 		case 'b': cfg.input_bpl      = (uint32_t)atoi(optarg); break;
 		case 'B': cfg.output_bpl     = (uint32_t)atoi(optarg); break;
 		case 'R': cfg.randomize_params = 1; cfg.with_params = 1;   break;
+		case 'A': cfg.refresh_params   = 1; cfg.with_params = 1;   break;
 		case 'p': cfg.with_params = 1; break;
-		case 'P':
-			/* -P <pattern>: enable gamma block with a startup pattern.
-			 * Useful for non-interactive file capture (-o). */
+		case 'P': {
+			/* -P <pattern>[:chan]: enable gamma with a startup pattern.
+			 * chan is any of r/g/b (default all).  Useful for
+			 * non-interactive file capture (-o). */
+			char pname[64] = {0}, chan[8] = {0};
 			cfg.with_params = 1;
-			cfg.gamma_pattern = params_gamma_pattern_from_name(optarg);
-			if (cfg.gamma_pattern < 0) {
-				fprintf(stderr,
-					"Invalid gamma pattern '%s' "
-					"(identity|zero|max|invert|random|curve)\n",
-					optarg);
-				return 1;
+			if (sscanf(optarg, "%63[^:]:%7s", pname, chan) >= 1) {
+				cfg.gamma_pattern = params_gamma_pattern_from_name(pname);
+				if (cfg.gamma_pattern < 0) {
+					fprintf(stderr, "Invalid gamma pattern '%s'\n", pname);
+					return 1;
+				}
+				if (chan[0]) {
+					int m = 0;
+					if (strchr(chan, 'r')) m |= 0x1;
+					if (strchr(chan, 'g')) m |= 0x2;
+					if (strchr(chan, 'b')) m |= 0x4;
+					cfg.gamma_chan = m ? m : 0x7;
+				}
 			}
 			break;
+		}
 		case 'h':
 			usage(argv[0]);
 			return 0;

@@ -36,6 +36,8 @@ static void print_help(void)
 		"  chroma_enhan.luma_k=N     Y offset\n"
 		"  chroma_enhan.coeff_ap=N   Cb positive coefficient\n"
 		"  chroma_enhan.coeff_am=N   Cb negative coefficient\n"
+		"  chroma_enhan.coeff_bp=N   Cb positive coefficient 2\n"
+		"  chroma_enhan.coeff_bm=N   Cb negative coefficient 2\n"
 		"  chroma_enhan.coeff_cp=N   Cr positive coefficient\n"
 		"  chroma_enhan.coeff_cm=N   Cr negative coefficient\n"
 		"  chroma_enhan.coeff_dp=N   Cr positive coefficient 2\n"
@@ -191,6 +193,8 @@ static int parse_command(const char *line, struct params_config *cfg)
 		else if (strcmp(field, "luma_k")    == 0) cfg->ce_luma_k    = (int16_t)value;
 		else if (strcmp(field, "coeff_ap")  == 0) cfg->ce_coeff_ap  = (int16_t)value;
 		else if (strcmp(field, "coeff_am")  == 0) cfg->ce_coeff_am  = (int16_t)value;
+		else if (strcmp(field, "coeff_bp")  == 0) cfg->ce_coeff_bp  = (int16_t)value;
+		else if (strcmp(field, "coeff_bm")  == 0) cfg->ce_coeff_bm  = (int16_t)value;
 		else if (strcmp(field, "coeff_cp")  == 0) cfg->ce_coeff_cp  = (int16_t)value;
 		else if (strcmp(field, "coeff_cm")  == 0) cfg->ce_coeff_cm  = (int16_t)value;
 		else if (strcmp(field, "coeff_dp")  == 0) cfg->ce_coeff_dp  = (int16_t)value;

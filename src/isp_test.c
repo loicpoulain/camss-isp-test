@@ -595,6 +595,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	struct isp_vnode *in_vn, *out_vn, *params_vn;
 	struct params_ctx params_ctx = { .fd = -1 };
 	struct params_config *params_cfgs = NULL;
+	struct params_config params_live;
 	struct params_ctrl params_ctrl = {};
 	int ret = -1;
 	int out_file_fd = -1;
@@ -887,16 +888,19 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 	/* Prepare params config (opened after Buffers: header below) */
 	unsigned int params_count = 0;
 	if (cfg->with_params && params_vn && params_vn->devnode[0]) {
-		params_count = cfg->randomize_params ? depth : 1;
+		params_count = (cfg->randomize_params || cfg->refresh_params) ? depth : 1;
 		params_cfgs = calloc(params_count, sizeof(*params_cfgs));
 		if (!params_cfgs) goto out;
 		for (unsigned int i = 0; i < params_count; i++) {
 			params_config_default(&params_cfgs[i]);
 			if (cfg->randomize_params)
 				params_config_randomize(&params_cfgs[i]);
+			if (cfg->refresh_params)
+				params_config_include_all(&params_cfgs[i]);
 			if (cfg->gamma_pattern >= 0) {
 				params_cfgs[i].gamma_pattern = cfg->gamma_pattern;
 				params_cfgs[i].gamma_enabled = 1;
+				params_cfgs[i].gamma_chan = cfg->gamma_chan;
 			}
 		}
 	} else if (cfg->with_params) {
@@ -932,8 +936,10 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 		if (params_open(params_vn->devnode, params_count, params_cfgs,
 				&params_ctx) < 0)
 			fprintf(stderr, "Warning: params open failed, continuing without\n");
-		else
+		else {
+			params_live = params_cfgs[0];
 			params_ctrl_start(&params_ctrl, &params_cfgs[0]);
+		}
 	}
 
 	uint32_t frame_ns_cap = cfg->duration_ms ? 4096 : cfg->num_frames;
@@ -1160,6 +1166,7 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 
 		/* Update params:
 		 * -R: cycle every frame with a new random config (stress test)
+		 * -A: cycle every frame with the full config (all blocks)
 		 * -p: only update when interactive control sends a new config */
 		if (params_ctx.fd >= 0) {
 			if (cfg->randomize_params) {
@@ -1167,6 +1174,12 @@ int isp_test_run(struct isp_pipeline *pipe, const struct frame_config *cfg)
 				params_config_default(&new_cfg);
 				params_config_randomize(&new_cfg);
 				params_buf = params_cycle(&params_ctx, &new_cfg);
+			} else if (cfg->refresh_params) {
+				/* Pick up interactive edits, then re-queue all
+				 * blocks so every frame reprograms the pipeline. */
+				params_ctrl_get(&params_ctrl, &params_live);
+				params_config_include_all(&params_live);
+				params_buf = params_cycle(&params_ctx, &params_live);
 			} else {
 				struct params_config new_cfg;
 				if (params_ctrl_get(&params_ctrl, &new_cfg))

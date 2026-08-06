@@ -24,6 +24,12 @@
  * @framerate:         nominal frame rate in fps (0 = do not set, driver default).
  *                    Passed to the input vnode via VIDIOC_S_PARM.
  * @randomize_params:  randomize params buffer before each frame (implies -p).
+ * @refresh_params:    re-queue a fully populated params buffer before every
+ *                     frame (wb_gain, chroma_enhan, color_correct, gamma).
+ *                     Buffers are prepared ahead of time, one per pipeline
+ *                     slot, like @randomize_params but without randomisation.
+ *                     Per-block enable state is preserved, so output is
+ *                     pixel-identical to a single-shot run.
  * @duration_ms:       run for this many milliseconds instead of num_frames
  *                     (0 = use num_frames). Per-frame prints are suppressed;
  *                     only the summary is printed at the end.
@@ -57,12 +63,14 @@ struct frame_config {
 	unsigned int pipeline_depth;
 	unsigned int framerate;
 	int          randomize_params;
+	int          refresh_params;
 	/*
 	 * Startup gamma test: pattern index (enum params_gamma_pattern) or -1
 	 * to leave the gamma block disabled.  Lets a non-interactive run
 	 * (e.g. writing to a file with -o) exercise the gamma path.
 	 */
 	int          gamma_pattern;
+	int          gamma_chan;
 	uint32_t     duration_ms;
 	const char  *input_device;
 	const char  *gst_pipeline;
